@@ -72,5 +72,9 @@ const FLOATING = 'id:global-floating-terminal'
 
 // Siempre una pestaña nueva, también en la flotante: las que ya están abiertas pueden ser un ssh a un servidor, y ni
 // el título ni el prompt lo dicen con certeza. Escribir ahí correría el comando en el servidor.
+// Si el comando sale bien, el shell termina y Orca cierra la pestaña sola. Si falla, queda abierta con el error.
+// Las llaves lo agrupan sin subshell: un `a; b` configurado no se convierte en `a; b && exit`.
+export const closingOnSuccess = (command) => `{ ${command}; } && exit`
+
 export const openTerminal = ({ title, command, floating = false }) =>
-  orca(['terminal', 'create', ...(floating ? ['--worktree', FLOATING] : []), '--title', title, '--command', command, '--focus', '--json'])
+  orca(['terminal', 'create', ...(floating ? ['--worktree', FLOATING] : []), '--title', title, '--command', closingOnSuccess(command), '--focus', '--json'])
