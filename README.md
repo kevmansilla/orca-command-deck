@@ -2,55 +2,60 @@
 
 Plugin para [Orca](https://github.com/stablyai/orca): un Source Control al estilo VS Code con todos tus proyectos, agrupados igual que en Orca. Cambios, commits, ramas e historial, sin entrar repo por repo.
 
-La app corre en una pestaña del navegador de Orca, porque los paneles laterales de los plugins no pueden ejecutar git. Escucha solo en `127.0.0.1` y usa un token que cambia en cada arranque.
+Arriba tiene además un tablero al estilo de [Pit Wall](https://github.com/Juanpe/orca-pit-wall): quién te espera, quién trabaja y tus bots.
+
+| Pestaña | Qué muestra |
+| --- | --- |
+| **Resumen** | Contadores de sesiones, bots y repos; el organigrama vos → proyectos → sesiones coloreado por estado; **Qué hacer ahora** y tus bots |
+| **Sesiones** | Las que te esperan, las que trabajan, los bots y, plegadas, las terminadas que ya abriste |
+| **Git** | El Source Control |
+
+Cuando una sesión pide permiso o hace una pregunta, avisa con una notificación de escritorio, aunque el panel esté cerrado. La campana «avisos» del panel los apaga. El panel se refresca solo con cada cambio de estado de un agente.
+
+Clic en una sesión lleva a su terminal (o a su workspace, si es un chat sin terminal); en un bot, abre ese bot en Orca. Los contadores de repos llevan a Git con ese filtro. Los datos salen de `worktree.ps` y `agent.list` por el socket de Orca.
+
+Se abre desde su ícono en la barra lateral de Orca. Es un solo panel para toda la ventana: no se repite por proyecto. El panel no puede conectarse a nada: le pide todo al worker del plugin, que se lo pasa a un único servidor local. El servidor escucha solo en `127.0.0.1` y usa un token que cambia en cada arranque.
 
 ## Instalación
 
-Necesitás Orca 1.4.245 o más nuevo.
+Necesitás Orca 1.4.259 o más nuevo.
 
-1. Cloná el repo:
+```bash
+orca plugin install kevmansilla/orca-multi-repo-git
+```
 
-   ```bash
-   git clone git@github.com:kevmansilla/orca-multi-repo-git.git ~/orca-plugins/multi-repo-git
-   ```
+Orca muestra lo que pide el plugin y la línea para volver a correrlo con `--approve <fingerprint>`. Pide correr su propio proceso (ejecuta git con tus permisos), mostrar notificaciones, guardar en su carpeta las sesiones que ya viste, leer tus workspaces y sus agentes (para el tablero y los avisos) y abrir workspaces o enfocar terminales (cuando hacés clic).
 
-2. En Orca, abrí Settings → Plugins y tocá **Turn on plugins** si están apagados.
-3. En **Development folders…**, agregá esa carpeta.
-4. Revisá el plugin y habilitalo. Es de acceso completo: corre con tus permisos.
+Después tocá su ícono (unas capas) en la barra lateral, o abrilo con:
 
-## Cómo se abre
+```bash
+orca plugin open kevmansilla.multi-repo-git --panel source-control
+```
 
-Con `Ctrl+Shift+J`, buscando **Git: Source Control de todos los repos**. También desde Settings → Plugins.
+Se actualiza con `orca plugin update kevmansilla.multi-repo-git`: Orca instala la última etiqueta `vX.Y.Z`. Se desinstala con `orca plugin uninstall kevmansilla.multi-repo-git`.
 
-El atajo `Ctrl+Alt+Shift+G` no funciona con el foco en una terminal: Orca solo pasa los atajos de plugins cuando el foco está en otra parte.
+### Desde una carpeta, para desarrollarlo
 
-## Dejarla siempre disponible (opcional, Linux)
+1. Cloná el repo y, en Orca, abrí Settings → Plugins y tocá **Turn on plugins** si están apagados.
+2. En **Development folders…**, agregá esa carpeta, o corré `orca plugin dev load <carpeta>`. Si después movés el repo, sacá la carpeta vieja y agregá la nueva: Orca no lo sigue.
+3. Aprobalo con `orca plugin dev reload <carpeta> --approve <fingerprint>` (el fingerprint lo imprime el mismo comando sin `--approve`).
 
-Sin esto, el servidor arranca con el comando y se apaga tras 10 minutos sin uso. Para que la pestaña se abra sola cada vez que abrís Orca, instalá el servicio de usuario de `systemd`. Necesita Node 22.5 o más nuevo.
+## Publicar una versión
+
+1. Subí `version` en `orca-plugin.json`, commiteá y pusheá a `main`.
+2. Etiquetá y pusheá la etiqueta: `git tag v0.3.0 && git push origin v0.3.0`.
+3. Opcional: `orca plugin release-entry .` imprime la entrada para listarlo en un catálogo de Orca.
+
+## Servidor siempre encendido (opcional, Linux)
+
+Sin esto, el servidor arranca cuando abrís el panel y se apaga tras 10 minutos sin uso. Con el servicio de usuario de `systemd` queda siempre encendido (unos 80 MB) y el panel responde al instante. Necesita Node 22.5 o más nuevo.
 
 ```bash
 bash scripts/install-service.sh          # instala y arranca
-bash scripts/install-service.sh url      # muestra la dirección para abrir en el navegador de Orca
 bash scripts/install-service.sh remove   # lo desinstala
 ```
 
-El servidor queda siempre encendido, con unos 80 MB de memoria. Usa un puerto y un token fijos, guardados con permisos `0600` en `~/.config/orca-multi-repo-git/service.env`. Al actualizar el plugin se reinicia solo.
-
-### En qué proyectos aparece
-
-Cada pestaña del navegador de Orca es de un workspace: al cambiar de proyecto, la de otro no se ve. Cada una gasta unos 175 MB, por eso no va en todos. Con `tabsIdleHours` en `policy.json`, la app sigue a tu trabajo:
-
-```json
-{ "tabsIdleHours": 2, "tabs": ["Proyecto-Bot-Wp"] }
-```
-
-- Aparece sola en los workspaces con actividad en las últimas `tabsIdleHours` horas (según la última actividad que registra Orca), sin cambiarte de proyecto.
-- Se cierra sola en los que llevan ese tiempo quietos. Una pestaña que abriste a mano dura por lo menos ese tiempo antes de cerrarse.
-- Los de `tabs` (nombre en Orca o carpeta) la tienen siempre. Es opcional.
-
-Si la cerrás, vuelve pasadas `tabsIdleHours` horas (2 sin ese valor), si el workspace sigue con actividad. Si Orca no la abrió (no respondió o dio error), se reintenta cada 2 minutos, hasta tres veces seguidas.
-
-Sin `tabsIdleHours`, la mantiene solo en los de `tabs`. Sin ninguna de las dos, la abre una vez por arranque de Orca, en el workspace activo.
+Usa un puerto y un token fijos, guardados con permisos `0600` en `~/.config/orca-multi-repo-git/service.env`. Al actualizar el plugin se reinicia solo.
 
 ## Protección
 

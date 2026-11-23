@@ -62,4 +62,4 @@ UNIT_EOF
 systemctl --user daemon-reload
 systemctl --user enable "$NAME" >/dev/null 2>&1
 systemctl --user restart "$NAME"
-echo "Servicio activo. Para ver la dirección: bash $ROOT/scripts/install-service.sh url"
+echo "Servicio activo. Abrí el panel desde su ícono en la barra lateral de Orca."

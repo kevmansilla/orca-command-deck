@@ -1,14 +1,18 @@
-// Abre la app en una pestaña del navegador de Orca, usando su CLI.
+// Lo que la app le pide a Orca: su socket para leer y llevar al usuario a una sesión, y su CLI para abrir terminales.
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
 // El shim va antes del PATH: un `orca` propio del usuario puede ser un launcher que agrega flags de Electron.
 const CLI_DIRS = [join(homedir(), '.config/orca/linux-orca-cli-shim')]
-const FALLBACK_DIRS = [join(homedir(), '.local/bin')]
+const FALLBACK_DIRS = [join(homedir(), '.local/bin'), '/Applications/Orca.app/Contents/Resources/bin']
+// Dónde deja Orca su configuración en Linux, macOS y Windows.
+const ORCA_DIRS = [join(homedir(), '.config/orca'), join(homedir(), 'Library/Application Support/orca'), join(homedir(), 'AppData/Roaming/orca')]
+
+export const runtimeFile = () => ORCA_DIRS.map((d) => join(d, 'orca-runtime.json')).find(existsSync) ?? join(ORCA_DIRS[0], 'orca-runtime.json')
 
 function orca(args) {
   const PATH = [...CLI_DIRS, process.env.PATH, ...FALLBACK_DIRS].filter(Boolean).join(delimiter)
@@ -22,7 +26,7 @@ function orca(args) {
 // Lo que el servicio consulta cada pocos segundos va directo al socket de Orca: cada llamada a la CLI levanta un
 // proceso que gasta un cuarto de segundo de CPU, y esto da unos milisegundos.
 function rpc(method, params = {}) {
-  const runtime = JSON.parse(readFileSync(join(homedir(), '.config/orca/orca-runtime.json'), 'utf8'))
+  const runtime = JSON.parse(readFileSync(runtimeFile(), 'utf8'))
   const endpoint = runtime.transports?.find((t) => t.kind === 'unix')?.endpoint
   if (!endpoint) return Promise.reject(new Error('Orca no expone su socket'))
   return new Promise((resolve, reject) => {
@@ -47,26 +51,30 @@ function rpc(method, params = {}) {
   })
 }
 
-export const openTab = (url) => orca(['tab', 'create', '--url', url, '--json'])
-
-// Sin cambiar el workspace que está mirando el usuario: la pestaña queda creada en segundo plano.
-export const openTabIn = (url, worktreeId) => rpc('browser.tabCreate', { url, worktree: `id:${worktreeId}` })
-
-// `ps` dice cuál es el workspace que está mirando el usuario (`isActive`); `list` no.
+// Los workspaces de Orca con sus agentes; `ps` los trae juntos, `list` no.
 export async function worktrees() {
   const { worktrees: all = [] } = await rpc('worktree.ps', { limit: 1000 })
   return all.filter((w) => !w.isArchived).map((w) => ({ ...w, id: w.worktreeId }))
 }
 
-// Las pestañas de la app, en cualquier proyecto.
+// Las pestañas del navegador que quedaron de cuando la app se abría ahí, en cualquier proyecto.
 export async function appTabs(port) {
   const { tabs = [] } = await rpc('browser.tabList')
   return tabs.filter((t) => t.url.includes(`127.0.0.1:${port}`)).map((t) => ({ worktreeId: t.worktreeId, page: t.browserPageId }))
 }
 
-export const worktreesWithTab = async (port) => new Set((await appTabs(port)).map((t) => t.worktreeId))
-
 export const closeTab = (page) => rpc('browser.tabClose', { page })
+
+// Las sesiones abiertas, también las que no tienen terminal (chats, bots).
+export async function openSessions() {
+  const { agents = [] } = await rpc('agent.list')
+  return new Set(agents.map((a) => a.orcaSessionId).filter(Boolean))
+}
+
+// Para Pit Wall: llevar al usuario a una sesión o a un workspace cuando hace clic.
+export const focusTerminal = (terminal) => rpc('terminal.focus', { terminal })
+
+export const activateWorktree = (worktreeId) => rpc('worktree.activate', { worktree: `id:${worktreeId}` })
 
 const FLOATING = 'id:global-floating-terminal'
 

@@ -1,7 +1,7 @@
 // Prueba las acciones de la app contra un repo descartable en una carpeta temporal. No toca los repos reales.
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const tmp = mkdtempSync(join(tmpdir(), 'mrg-test-'))
@@ -75,7 +75,27 @@ process.env.MRG_POLICY_FILE = join(tmp, 'policy.json')
 
 const { fillCommand, prUrl, shellQuote, startServer } = await import('./server.mjs')
 const opened = []
-const { port, token, close } = await startServer({ terminal: async (t) => opened.push(t) })
+const enfocadas = []
+const activados = []
+const orcaFalso = {
+  worktrees: async () => [{
+    worktreeId: 'r1::/p/app', repo: 'app', displayName: 'app', path: join(tmp, 'app'), branch: 'refs/heads/master', workspaceKind: 'git', lastActivityAt: 5,
+    agents: [
+      { address: 'term_a1', state: 'done', stateStartedAt: 100, conversationName: '<local-command-caveat>x</local-command-caveat> Plan de cuentas', lastAssistantMessage: '## Listo\n\n**Hecho** el `cambio`' },
+      { address: 'term_b2', state: 'working', stateStartedAt: 200, taskTitle: 'Tests', toolName: 'Bash', toolInput: 'npm test' },
+      { address: 'term_c3', state: 'working', interrupted: true, stateStartedAt: 50, prompt: 'cortada' },
+      { state: 'done', stateStartedAt: 10, conversationName: 'cerrada', orcaSessionId: 's-vieja' },
+      { state: 'waiting', stateStartedAt: 300, conversationName: 'chat', orcaSessionId: 's-chat' }
+    ]
+  }, {
+    worktreeId: 'b1::/bots/k', path: '/bots/k', repo: 'Bots', displayName: 'Kevinito', bot: 'Kevinito', status: 'inactive', workspaceKind: 'folder-workspace', lastActivityAt: 9, agents: []
+  }],
+  sessions: async () => new Set(['s-chat']),
+  bots: () => [{ name: 'Kevinito', path: '/bots/k' }, { name: 'Notificaciones', path: '/bots/n' }],
+  focus: async (t) => { if (t === 'term_b2') throw new Error('stale'); enfocadas.push(t) },
+  activate: async (id) => activados.push(id)
+}
+const { port, token, close } = await startServer({ terminal: async (t) => opened.push(t), orca: orcaFalso })
 const base = `http://127.0.0.1:${port}`
 let failures = 0
 
@@ -244,42 +264,33 @@ try {
   const standing = (await call('/api/repos?fresh=1'))[1].find((r) => r.key === wtMerge)
   check('una rama fija (standingBranches) no figura como mergeada ni ofrece el comando de rama', standing.merged === null && !standing.commands.some((c) => c.label.startsWith('A ')))
   writeFileSync(policyFile, policyBefore)
-  const { matches } = await import('./orca-launch.mjs')
-  const ws = { displayName: 'Proyecto-Bot-Wp', path: join(homedir(), 'Proyecto') }
-  check('la pestaña fija reconoce el workspace por nombre', matches('Proyecto-Bot-Wp', ws))
-  check('la pestaña fija reconoce el workspace por carpeta', matches('~/Proyecto/', ws) && matches(ws.path, ws))
-  check('la pestaña fija no toma otro workspace', !matches('Proyecto', ws) && !matches('~/Proyecto/otro', ws))
-  const { plan, pendingTabs, markTried, parseOpened } = await import('./orca-launch.mjs')
-  const H = 3_600_000
-  const now = 10 * H
-  const w = (id, ago) => ({ id, displayName: id, path: '/x/' + id, lastActivityAt: now - ago })
-  const wts = [w('activo', 0.1 * H), w('quieto', 5 * H), w('fijo', 9 * H)]
-  const tab = (id) => ({ worktreeId: id, page: 'p-' + id })
-  const viejas = new Map([['p-quieto', now - 3 * H], ['p-fijo', now - 9 * H]])
-  const auto = plan({ all: wts, tabs: [tab('quieto'), tab('fijo')], pinned: ['fijo'], idleMs: 2 * H, since: viejas, now })
-  check('abre la app donde hubo actividad reciente', auto.open.join() === 'activo')
-  check('la cierra donde está quieto, salvo en los fijos', auto.close.join() === 'p-quieto')
-  const recien = plan({ all: wts, tabs: [tab('quieto')], pinned: [], idleMs: 2 * H, since: new Map([['p-quieto', now - 0.5 * H]]), now })
-  check('no cierra una pestaña que el usuario acaba de abrir', recien.close.length === 0)
-  const fijos = plan({ all: wts, tabs: [tab('quieto')], pinned: ['fijo'], idleMs: null, since: viejas, now })
-  const M = 60_000
-  const abiertas = new Map()
-  markTried(abiertas, 'sin-listar', now)
-  check('no repite enseguida una pestaña que intentó abrir', pendingTabs(['sin-listar', 'nuevo'], abiertas, [], now + M, 2 * H).join() === 'nuevo')
-  check('reintenta una pestaña que nunca apareció', pendingTabs(['sin-listar'], abiertas, [], now + 2 * M, 2 * H).join() === 'sin-listar')
-  markTried(abiertas, 'sin-listar', now + 2 * M)
-  markTried(abiertas, 'sin-listar', now + 4 * M)
-  check('después de tres intentos espera como una cerrada', pendingTabs(['sin-listar'], abiertas, [], now + 7 * M, 2 * H).length === 0 &&
-    pendingTabs(['sin-listar'], abiertas, [], now + 4 * M + 2 * H, 2 * H).join() === 'sin-listar')
-  check('no reabre enseguida una pestaña que figuró y dejó de figurar', pendingTabs(['listada'], abiertas, [{ worktreeId: 'listada' }], now, 2 * H).length === 0 &&
-    pendingTabs(['listada'], abiertas, [], now + 5 * M, 2 * H).length === 0)
-  check('la cerrada vuelve pasado tabsIdleHours', pendingTabs(['listada'], abiertas, [], now + 2 * H, 2 * H).join() === 'listada')
-  check('lee el estado viejo como pestañas recién cerradas', parseOpened('{"launch":"1","worktrees":["a"]}', '1', now).get('a').seen === true)
-  check('el estado de otro arranque de Orca no cuenta', parseOpened('{"launch":"1","worktrees":{"a":{"at":0,"tries":1,"seen":false}}}', '2', now).size === 0)
-  check('un estado ilegible arranca de cero', parseOpened('{roto', '1', now).size === 0)
-  const mirando = plan({ all: [{ ...w('quieto', 5 * H), isActive: true }], tabs: [], pinned: [], idleMs: 2 * H, since: viejas, now })
-  check('abre la app en el workspace que está mirando, aunque esté quieto', mirando.open.join() === 'quieto')
-  check('sin tabsIdleHours solo abre los fijos y no cierra nada', fijos.open.join() === 'fijo' && fijos.close.length === 0)
+  const { buildSnapshot, flatten } = await import('./pitwall.mjs')
+  const snap = buildSnapshot(await orcaFalso.worktrees(), 1000, await orcaFalso.sessions(), orcaFalso.bots())
+  check('pit wall deja afuera las sesiones cerradas', snap.waiting.length + snap.working.length === 4)
+  check('pit wall muestra el chat abierto sin terminal', snap.waiting.some((a) => a.title === 'chat' && a.terminalId === null))
+  check('pit wall marca quieta la sesión cortada', snap.waiting.some((a) => a.terminalId === 'term_c3' && a.state === 'idle'))
+  check('pit wall ordena las que esperan por antigüedad', snap.waiting.map((a) => a.terminalId).join() === 'term_c3,term_a1,')
+  check('pit wall limpia las marcas del título', snap.waiting.find((a) => a.terminalId === 'term_a1').title === 'Plan de cuentas')
+  check('pit wall aplana el último mensaje', snap.waiting.find((a) => a.terminalId === 'term_a1').lastMessage === 'Listo Hecho el cambio')
+  check('pit wall muestra la herramienta en curso', snap.working[0].activity === 'Bash · npm test')
+  check('pit wall lista los bots aunque estén dormidos', snap.bots.some((b) => b.name === 'Kevinito' && b.status === 'inactive' && b.worktreeId))
+  check('pit wall suma los bots que Orca no tiene abiertos, sin repetir', snap.bots.length === 2 && snap.bots.some((b) => b.name === 'Notificaciones' && b.status === 'closed' && b.worktreeId === null))
+  check('pit wall pasa la carpeta de cada sesión para abrirla', snap.waiting.every((a) => a.path))
+  check('pit wall cuenta los workspaces', snap.worktrees === 2)
+  check('flatten recorta los mensajes largos', flatten('x'.repeat(300)).length === 140)
+  const { shouldNotify } = await import('./main.mjs')
+  const estados = new Map()
+  check('avisa cuando una sesión pide permiso', shouldNotify(estados, { paneKey: 'p1', state: 'blocked' }))
+  check('no repite el aviso del mismo estado', !shouldNotify(estados, { paneKey: 'p1', state: 'blocked' }))
+  check('no avisa cuando trabaja o termina', !shouldNotify(estados, { paneKey: 'p1', state: 'working' }) && !shouldNotify(estados, { paneKey: 'p1', state: 'done' }))
+  check('vuelve a avisar si después pregunta', shouldNotify(estados, { paneKey: 'p1', state: 'waiting' }))
+  const [codigoWall, wall] = await call('/api/pitwall')
+  check('/api/pitwall devuelve las sesiones', codigoWall === 200 && wall.working.length === 1 && wall.error === null)
+  check('/api/open enfoca la terminal', (await call('/api/open', { worktreeId: 'r1::/p/app', terminalId: 'term_a1' }))[0] === 200 && enfocadas.join() === 'term_a1')
+  check('/api/open abre el workspace si la terminal se cerró', (await call('/api/open', { worktreeId: 'r1::/p/app', terminalId: 'term_b2' }))[0] === 200 && activados.join() === 'r1::/p/app')
+  check('/api/open no enfoca una terminal de otro workspace', (await call('/api/open', { worktreeId: 'r1::/p/app', terminalId: 'term_zz' }))[0] === 200 && enfocadas.length === 1 && activados.length === 2)
+  check('sirve el código de la página sin token', (await fetch(base + '/app.js')).status === 200 && (await fetch(base + '/app.css')).status === 200)
+  check('/api/open rechaza un workspace desconocido', (await call('/api/open', { worktreeId: 'otro' }))[0] === 400)
 } finally {
   close()
 }

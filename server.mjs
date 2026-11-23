@@ -8,10 +8,14 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
-import { openTerminal } from './orca-tab.mjs'
+import { activateWorktree, focusTerminal, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
+import { buildSnapshot, isTerminal } from './pitwall.mjs'
 
 const HOME = homedir()
 const INDEX = fileURLToPath(new URL('./index.html', import.meta.url))
+// El código de la página va en archivos aparte porque el panel lateral de Orca no corre scripts inline. No tiene secretos:
+// se sirve sin token, y la página sigue exigiéndolo.
+const ASSETS = { '/app.js': 'text/javascript; charset=utf-8', '/app.css': 'text/css; charset=utf-8' }
 const POLICY_FILE = process.env.MRG_POLICY_FILE ?? join(HOME, '.config/orca-multi-repo-git/policy.json')
 const REPOS_FILE = process.env.MRG_REPOS_FILE
 const ORCA_DIRS = [join(HOME, '.config/orca'), join(HOME, 'Library/Application Support/orca'), join(HOME, 'AppData/Roaming/orca')]
@@ -33,6 +37,8 @@ const FETCH_AT_ONCE = 4
 // Un repo sin movimiento se revisa cada tanto; el que cambió hace poco, en cada consulta.
 const QUIET_CHECK_MS = 20_000
 const ACTIVE_MS = 2 * 60_000
+// La pestaña consulta Pit Wall cada pocos segundos: dentro de esta ventana se reusa la última respuesta de Orca.
+const PITWALL_CACHE_MS = 2_000
 // Solo pide confirmación: un falso positivo cuesta un clic, y un secreto subido no se puede deshacer.
 const SENSITIVE_RE = /(^|\/)(\.env(\.(?!example$|sample$|template$|dist$)[^/]+)?|\.netrc|\.npmrc|\.pgpass|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)|credentials(\.[^/]+)?|secrets?(\.[^/]+)?|[^/]+\.(pem|key|p12|pfx|jks|keystore|tfstate|tfvars))$/i
 
@@ -676,14 +682,61 @@ function readBody(req) {
   })
 }
 
-export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTerminal } = {}) {
+// Los bots de Orca viven en carpetas con un bot.json; uno que no está abierto como workspace solo se ve acá.
+const BOTS_DIR = join(HOME, '.orca/bots')
+
+function botDirs() {
+  if (!existsSync(BOTS_DIR)) return []
+  return readdirSync(BOTS_DIR, { withFileTypes: true }).flatMap((e) => {
+    if (!e.isDirectory()) return []
+    const path = join(BOTS_DIR, e.name)
+    const bot = readJson(join(path, 'bot.json'))
+    return bot ? [{ name: typeof bot.name === 'string' && bot.name ? bot.name : e.name, path }] : []
+  })
+}
+
+const ORCA = { worktrees: orcaWorktrees, sessions: openSessions, bots: botDirs, focus: focusTerminal, activate: activateWorktree }
+
+export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTerminal, orca = ORCA } = {}) {
   const token = process.env.MRG_TOKEN ?? randomBytes(32).toString('base64url')
   // Se lee una sola vez: si el plugin se actualiza, un servidor viejo no debe servir una página que no sabe atender.
   const page = readFileSync(INDEX)
+  const assets = Object.fromEntries(Object.keys(ASSETS).map((path) => [path, readFileSync(fileURLToPath(new URL(`.${path}`, import.meta.url)))]))
   const queues = new Map()
   const summaries = new Map()
   let lastUse = Date.now()
   let lastFetch = 0
+  let pitwall = null
+
+  async function pitwallSnapshot() {
+    if (pitwall && Date.now() - pitwall.at < PITWALL_CACHE_MS) return pitwall.data
+    let data
+    try {
+      const [worktrees, sessions] = await Promise.all([orca.worktrees(), orca.sessions()])
+      data = buildSnapshot(worktrees, Date.now(), sessions, orca.bots())
+    } catch (e) {
+      // Sin Orca no hay sesiones, pero la parte de git sigue andando: la pestaña muestra el aviso.
+      data = { ...buildSnapshot([], Date.now()), error: `No pude leer Orca: ${e.message}` }
+    }
+    pitwall = { at: Date.now(), data }
+    return data
+  }
+
+  // Solo lleva a una sesión o a un workspace que Orca acaba de listar: el id viene de la página.
+  async function openInOrca(body) {
+    const known = (await orca.worktrees()).find((w) => w.worktreeId === body.worktreeId)
+    if (!known) throw new ActionError('Ese workspace ya no está en Orca.')
+    const terminal = isTerminal(body.terminalId) && known.agents?.some((a) => a.address === body.terminalId) ? body.terminalId : null
+    if (terminal) {
+      try {
+        await orca.focus(terminal)
+        return
+      } catch {
+        // La terminal se cerró entre la consulta y el clic: se abre el workspace.
+      }
+    }
+    await orca.activate(known.worktreeId)
+  }
 
   // Vence la consulta pero conserva changedAt: si no, todos los repos pasarían a contar como activos.
   function expireSummaries() {
@@ -732,7 +785,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'no-referrer',
-      'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"
+      'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'"
     })
     res.end(data)
   }
@@ -750,9 +803,11 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
       lastUse = Date.now()
       return reply(res, 200, page, 'text/html; charset=utf-8')
     }
+    if (ASSETS[url.pathname]) return allowedHost ? reply(res, 200, assets[url.pathname], ASSETS[url.pathname]) : reply(res, 403, 'Host', 'text/plain')
     if (!allowedHost || !sameToken(req.headers['x-token'], token)) return reply(res, 403, { error: 'token' })
     lastUse = Date.now()
     if (url.pathname === '/api/ping') return reply(res, 200, { ok: true })
+    if (url.pathname === '/api/pitwall') return reply(res, 200, await pitwallSnapshot())
     if (url.pathname === '/api/repos') {
       if (q.get('fresh') === '1') expireSummaries()
       const items = []
@@ -783,6 +838,14 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
       body = JSON.parse(await readBody(req))
     } catch (e) {
       throw e instanceof ActionError ? e : new ActionError('Pedido inválido.')
+    }
+    if (url.pathname === '/api/open') {
+      try {
+        await openInOrca(body)
+      } catch (e) {
+        throw e instanceof ActionError ? e : new ActionError('Orca no pudo abrirlo.')
+      }
+      return reply(res, 200, { ok: true })
     }
     const item = repoOf(body.repo)
     if (url.pathname === '/api/run') {

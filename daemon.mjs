@@ -1,7 +1,7 @@
 // Proceso aparte para el servidor: Orca mata al worker a los 5 minutos sin eventos, y el uso de la app no cuenta.
 // Se apaga solo cuando pasan IDLE_MS sin pedidos; la pestaña abierta le manda un ping cada minuto.
 import { rmSync } from 'node:fs'
-import { keepTabs } from './orca-launch.mjs'
+import { appTabs, closeTab } from './orca-tab.mjs'
 import { readState, serverStamp, statePath, writeState } from './state.mjs'
 import { startServer } from './server.mjs'
 
@@ -10,6 +10,16 @@ const CODE_CHECK_MS = 15_000
 // Con puerto fijo lo administra un servicio: no se apaga por inactividad y conserva la dirección de la pestaña.
 const FIXED_PORT = Number(process.env.MRG_PORT) || 0
 const managed = FIXED_PORT > 0
+
+// Antes la app se abría en una pestaña del navegador por proyecto; ahora vive en el panel lateral. Las que quedaron
+// abiertas de versiones anteriores se cierran una vez, al arrancar.
+async function closeOldTabs(port) {
+  try {
+    for (const { page } of await appTabs(port)) await closeTab(page)
+  } catch (e) {
+    console.error(`no pude cerrar las pestañas viejas: ${e.message}`) // Orca cerrada: no hay pestañas
+  }
+}
 
 function stop() {
   if (readState()?.pid === process.pid) rmSync(statePath(), { force: true })
@@ -23,5 +33,5 @@ process.on('SIGTERM', stop)
 // El servicio lo vuelve a levantar, así una actualización del plugin entra sin pasos a mano.
 if (managed) {
   setInterval(() => serverStamp() !== stamp && stop(), CODE_CHECK_MS).unref()
-  keepTabs(port, token)
+  closeOldTabs(port)
 }
