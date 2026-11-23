@@ -33,7 +33,7 @@ sh(tmp, 'git', 'clone', '-q', 'remote.git', 'cerrada')
 writeFileSync(join(tmp, 'bases-editables.json'), JSON.stringify({ default: 'master' }))
 writeFileSync(join(tmp, 'settings.json'), JSON.stringify({ env: { EDITABLES: 'otro, editable' } }))
 writeFileSync(join(tmp, 'repos.json'), JSON.stringify(['app', 'sin-regla', 'libre', 'mixta', 'editable', 'cerrada'].map((name) => ({ name, path: join(tmp, name) }))))
-// Como el pre-push del harness: un push a una rama tiene que nombrar esa misma rama, no HEAD.
+// Como un pre-push que exige que un push a una rama nombre esa misma rama, no HEAD.
 writeFileSync(join(repo, '.git/hooks/pre-push'), `#!/bin/sh
 while read -r local_ref local_sha remote_ref remote_sha; do [ "$local_ref" = "$remote_ref" ] || exit 1; done
 `, { mode: 0o755 })
@@ -81,17 +81,17 @@ const orcaFalso = {
   worktrees: async () => [{
     worktreeId: 'r1::/p/app', repo: 'app', displayName: 'app', path: join(tmp, 'app'), branch: 'refs/heads/master', workspaceKind: 'git', lastActivityAt: 5,
     agents: [
-      { address: 'term_a1', state: 'done', stateStartedAt: 100, conversationName: '<local-command-caveat>x</local-command-caveat> Plan de cuentas', lastAssistantMessage: '## Listo\n\n**Hecho** el `cambio`' },
+      { address: 'term_a1', state: 'done', stateStartedAt: 100, conversationName: '<local-command-caveat>x</local-command-caveat> Arreglar el login', lastAssistantMessage: '## Listo\n\n**Hecho** el `cambio`' },
       { address: 'term_b2', state: 'working', stateStartedAt: 200, taskTitle: 'Tests', toolName: 'Bash', toolInput: 'npm test' },
       { address: 'term_c3', state: 'working', interrupted: true, stateStartedAt: 50, prompt: 'cortada' },
       { state: 'done', stateStartedAt: 10, conversationName: 'cerrada', orcaSessionId: 's-vieja' },
       { state: 'waiting', stateStartedAt: 300, conversationName: 'chat', orcaSessionId: 's-chat' }
     ]
   }, {
-    worktreeId: 'b1::/bots/k', path: '/bots/k', repo: 'Bots', displayName: 'Kevinito', bot: 'Kevinito', status: 'inactive', workspaceKind: 'folder-workspace', lastActivityAt: 9, agents: []
+    worktreeId: 'b1::/bots/k', path: '/bots/k', repo: 'Bots', displayName: 'Asistente', bot: 'Asistente', status: 'inactive', workspaceKind: 'folder-workspace', lastActivityAt: 9, agents: []
   }],
   sessions: async () => new Set(['s-chat']),
-  bots: () => [{ name: 'Kevinito', path: '/bots/k' }, { name: 'Notificaciones', path: '/bots/n' }],
+  bots: () => [{ name: 'Asistente', path: '/bots/k' }, { name: 'Avisos', path: '/bots/n' }],
   focus: async (t) => { if (t === 'term_b2') throw new Error('stale'); enfocadas.push(t) },
   activate: async (id) => activados.push(id)
 }
@@ -270,11 +270,11 @@ try {
   check('pit wall muestra el chat abierto sin terminal', snap.waiting.some((a) => a.title === 'chat' && a.terminalId === null))
   check('pit wall marca quieta la sesión cortada', snap.waiting.some((a) => a.terminalId === 'term_c3' && a.state === 'idle'))
   check('pit wall ordena las que esperan por antigüedad', snap.waiting.map((a) => a.terminalId).join() === 'term_c3,term_a1,')
-  check('pit wall limpia las marcas del título', snap.waiting.find((a) => a.terminalId === 'term_a1').title === 'Plan de cuentas')
+  check('pit wall limpia las marcas del título', snap.waiting.find((a) => a.terminalId === 'term_a1').title === 'Arreglar el login')
   check('pit wall aplana el último mensaje', snap.waiting.find((a) => a.terminalId === 'term_a1').lastMessage === 'Listo Hecho el cambio')
   check('pit wall muestra la herramienta en curso', snap.working[0].activity === 'Bash · npm test')
-  check('pit wall lista los bots aunque estén dormidos', snap.bots.some((b) => b.name === 'Kevinito' && b.status === 'inactive' && b.worktreeId))
-  check('pit wall suma los bots que Orca no tiene abiertos, sin repetir', snap.bots.length === 2 && snap.bots.some((b) => b.name === 'Notificaciones' && b.status === 'closed' && b.worktreeId === null))
+  check('pit wall lista los bots aunque estén dormidos', snap.bots.some((b) => b.name === 'Asistente' && b.status === 'inactive' && b.worktreeId))
+  check('pit wall suma los bots que Orca no tiene abiertos, sin repetir', snap.bots.length === 2 && snap.bots.some((b) => b.name === 'Avisos' && b.status === 'closed' && b.worktreeId === null))
   check('pit wall pasa la carpeta de cada sesión para abrirla', snap.waiting.every((a) => a.path))
   check('pit wall cuenta los workspaces', snap.worktrees === 2)
   check('flatten recorta los mensajes largos', flatten('x'.repeat(300)).length === 140)

@@ -38,7 +38,7 @@
   "tickets": [
     {
       "under": "~/trabajo",
-      "dir": "~/trabajo/harness/tickets"
+      "dir": "~/trabajo/tickets"
     }
   ],
   "scan": {

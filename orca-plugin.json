@@ -1,9 +1,9 @@
 {
   "manifestVersion": 2,
-  "id": "multi-repo-git",
-  "name": "Multi Repo Git",
-  "version": "0.3.0",
-  "description": "Source Control de todos los repos de Orca y un tablero de quién te espera, quién trabaja y tus bots. Abrilo desde su ícono en la barra lateral.",
+  "id": "command-deck",
+  "name": "Command Deck",
+  "version": "0.3.1",
+  "description": "Tus agentes, bots y repos en un solo panel: quién te espera, quién trabaja, y el Source Control de todos los repos de Orca.",
   "engines": {
     "orca": ">=1.4.259"
   },
@@ -13,8 +13,8 @@
   "contributes": {
     "panels": [
       {
-        "id": "source-control",
-        "title": "Multi Repo Git",
+        "id": "command-deck",
+        "title": "Command Deck",
         "icon": "layers",
         "entry": "index.html",
         "ui": "html"

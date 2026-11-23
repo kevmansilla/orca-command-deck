@@ -793,7 +793,7 @@ function readSeen() {
 }
 function store(key, value) {
   // En el panel lo propio va al storage del plugin: un frame aislado puede no tener localStorage.
-  if (PANEL) return orca.storage.set(key, value).catch(function (e) { console.error('[multi-repo-git] no se guardó ' + key, e) })
+  if (PANEL) return orca.storage.set(key, value).catch(function (e) { console.error('[command-deck] no se guardó ' + key, e) })
   try {
     localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value))
   } catch (e) {

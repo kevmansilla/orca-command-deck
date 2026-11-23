@@ -1,6 +1,6 @@
-# Multi Repo Git
+# Command Deck
 
-Plugin para [Orca](https://github.com/stablyai/orca): un Source Control al estilo VS Code con todos tus proyectos, agrupados igual que en Orca. Cambios, commits, ramas e historial, sin entrar repo por repo.
+Plugin para [Orca](https://github.com/stablyai/orca): tus agentes, bots y repos en un solo panel. Muestra quién te espera y quién trabaja, y trae un Source Control al estilo VS Code con todos tus proyectos, agrupados igual que en Orca: cambios, commits, ramas e historial, sin entrar repo por repo.
 
 Arriba tiene además un tablero al estilo de [Pit Wall](https://github.com/Juanpe/orca-pit-wall): quién te espera, quién trabaja y tus bots.
 
@@ -21,7 +21,7 @@ Se abre desde su ícono en la barra lateral de Orca. Es un solo panel para toda 
 Necesitás Orca 1.4.259 o más nuevo.
 
 ```bash
-orca plugin install kevmansilla/orca-multi-repo-git
+orca plugin install kevmansilla/orca-command-deck
 ```
 
 Orca muestra lo que pide el plugin y la línea para volver a correrlo con `--approve <fingerprint>`. Pide correr su propio proceso (ejecuta git con tus permisos), mostrar notificaciones, guardar en su carpeta las sesiones que ya viste, leer tus workspaces y sus agentes (para el tablero y los avisos) y abrir workspaces o enfocar terminales (cuando hacés clic).
@@ -29,10 +29,10 @@ Orca muestra lo que pide el plugin y la línea para volver a correrlo con `--app
 Después tocá su ícono (unas capas) en la barra lateral, o abrilo con:
 
 ```bash
-orca plugin open kevmansilla.multi-repo-git --panel source-control
+orca plugin open kevmansilla.command-deck --panel command-deck
 ```
 
-Se actualiza con `orca plugin update kevmansilla.multi-repo-git`: Orca instala la última etiqueta `vX.Y.Z`. Se desinstala con `orca plugin uninstall kevmansilla.multi-repo-git`.
+Se actualiza con `orca plugin update kevmansilla.command-deck`: Orca instala la última etiqueta `vX.Y.Z`. Se desinstala con `orca plugin uninstall kevmansilla.command-deck`.
 
 ### Desde una carpeta, para desarrollarlo
 
@@ -96,7 +96,7 @@ Con `"pullRequests": false` se oculta el botón Abrir PR.
 
 ## Tickets
 
-`"tickets": [{ "under": "~/trabajo", "dir": "~/trabajo/harness/tickets" }]` une cada rama con la carpeta de su ticket. De `ABC-123-algo` busca `ABC-123-*` en `dir` y en `dir/_archivo`, y muestra el estado de `US.md` (`- **Estado:** en curso`). También avisa si `test.md` no tiene nada propio o si `deploy.md` tiene pasos sin ejecutar. Lo que coincide con `_template/` no cuenta.
+`"tickets": [{ "under": "~/trabajo", "dir": "~/trabajo/tickets" }]` une cada rama con la carpeta de su ticket. De `ABC-123-algo` busca `ABC-123-*` en `dir` y en `dir/_archivo`, y muestra el estado de `US.md` (`- **Estado:** en curso`). También avisa si `test.md` no tiene nada propio o si `deploy.md` tiene pasos sin ejecutar. Lo que coincide con `_template/` no cuenta.
 
 ## Secretos
 
