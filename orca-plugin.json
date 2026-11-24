@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "command-deck",
   "name": "Command Deck",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Tus agentes, bots y repos en un solo panel: quién te espera, quién trabaja, y el Source Control de todos los repos de Orca.",
   "engines": {
     "orca": ">=1.4.259"

@@ -273,3 +273,6 @@ a.commit { display:flex; align-items:center; justify-content:center; text-decora
   #close { display:none; }
   .kpis { grid-template-columns:repeat(2, 1fr); }
 }
+/* Avisos: los no leídos resaltan; el mensaje entero, en hasta tres líneas. */
+.item.notice.unread { background:color-mix(in srgb, var(--c) 8%, var(--card)); }
+.item.notice .msg { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; white-space:normal; }

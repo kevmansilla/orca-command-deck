@@ -108,3 +108,44 @@ export function buildSnapshot(worktrees, now, open = new Set(), botDirs = []) {
   bots.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
   return { generatedAt: now, waiting, working, bots, worktrees: count, error: null }
 }
+
+// Los estados en que una sesión te necesita, con lo que dice el aviso.
+export const NEEDS_YOU = { blocked: 'pide permiso', waiting: 'tiene una pregunta' }
+export const NOTICES_MAX = 30
+
+// Avisos de los chats sin terminal (los bots y los chats nativos): Orca solo emite `agent.status.changed` para las
+// terminales, así que el worker los saca comparando un snapshot con el anterior. Un bot avisa también cuando termina,
+// porque trabaja solo; un chat, solo cuando te necesita. `prev` es null en la primera vuelta, que solo toma nota, y
+// `after` descarta los estados viejos de una sesión que recién se abre.
+export function chatNotices(prev, snapshot, now, after = 0) {
+  const bots = new Set(snapshot.bots.filter((b) => b.worktreeId).map((b) => b.worktreeId))
+  const seen = new Map()
+  const notices = []
+  for (const row of snapshot.waiting.concat(snapshot.working)) {
+    if (row.terminalId) continue // las terminales avisan por el evento
+    const sig = `${row.state}|${row.since}`
+    seen.set(row.key, sig)
+    if (!prev || prev.get(row.key) === sig || row.since <= after) continue
+    const bot = bots.has(row.worktreeId)
+    const what = NEEDS_YOU[row.state] ?? (bot && row.state === 'done' ? 'terminó' : null)
+    if (!what) continue
+    notices.push({
+      id: `${row.key}|${sig}`,
+      at: now,
+      state: row.state,
+      bot,
+      title: `${row.title} ${what}`,
+      where: row.project === row.workspace ? row.project : `${row.project} › ${row.workspace}`,
+      body: row.lastMessage ?? null,
+      path: row.path ?? null,
+      terminalId: null
+    })
+  }
+  return { seen, notices }
+}
+
+// Suma un aviso a la bandeja (lo más nuevo primero) sin repetirlo.
+export function addNotice(list, notice, max = NOTICES_MAX) {
+  const rest = (Array.isArray(list) ? list : []).filter((n) => n.id !== notice.id)
+  return [notice, ...rest].slice(0, max)
+}

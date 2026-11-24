@@ -3,16 +3,18 @@
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { addNotice, chatNotices, NEEDS_YOU } from './pitwall.mjs'
 import { readState, serverStamp } from './state.mjs'
 
 const DAEMON = fileURLToPath(new URL('./daemon.mjs', import.meta.url))
 const START_TRIES = 50
 const API_PATH_RE = /^\/api\/[a-z-]+(\?[^\s#]*)?$/
 const TERMINAL_RE = /^term_[\w-]+$/
-// Igual que en app.js: la campana del panel guarda acá si se avisa.
+// Igual que en app.js: la campana del panel guarda acá si se avisa, y la pestaña Avisos lee la bandeja.
 const NOTIFY_KEY = 'notify'
-// Los estados en que una sesión te necesita, con lo que dice el aviso.
-const NEEDS_YOU = { blocked: 'pide permiso', waiting: 'tiene una pregunta' }
+const NOTICES_KEY = 'avisos'
+// Cada cuánto se miran los chats sin terminal (bots y chats nativos), que no llegan por el evento.
+const CHAT_POLL_MS = 15000
 
 async function alive(state) {
   if (!state) return false
@@ -99,18 +101,65 @@ export function shouldNotify(last, event) {
   return !!NEEDS_YOU[event.state] && before !== event.state
 }
 
-async function notify(orca, event) {
-  if ((await orca.storage.get(NOTIFY_KEY)) === false) return
-  let where = ''
+async function whereOf(orca, workspaceListId) {
   try {
     const { workspaces } = await orca.host.call('workspace.list')
-    const ws = workspaces.find((w) => w.id === event.workspaceListId)
-    if (ws) where = ws.project && ws.project !== ws.name ? `${ws.project} › ${ws.name}` : ws.name
+    const ws = workspaces.find((w) => w.id === workspaceListId)
+    if (!ws) return { where: null, path: null }
+    return { where: ws.project && ws.project !== ws.name ? `${ws.project} › ${ws.name}` : ws.name, path: ws.path ?? null }
   } catch (e) {
     orca.log(`no pude leer los workspaces para el aviso: ${e.message}`) // el aviso sale igual, sin el lugar
+    return { where: null, path: null }
   }
-  const title = `${event.title || 'Una sesión'} ${NEEDS_YOU[event.state]}`
-  await orca.host.call('notifications.show', { title, body: where || undefined })
+}
+
+// Guarda el aviso en la bandeja del panel (siempre) y lo muestra en el escritorio (si la campana está prendida).
+// Las escrituras van en fila: dos avisos juntos no se pisan la bandeja.
+let saving = Promise.resolve()
+function deliver(orca, notice) {
+  saving = saving.then(async () => {
+    const list = await orca.storage.get(NOTICES_KEY).catch(() => null)
+    await orca.storage.set(NOTICES_KEY, addNotice(list, notice))
+  }).catch((e) => orca.log(`no pude guardar el aviso: ${e.message}`))
+  return saving.then(async () => {
+    if ((await orca.storage.get(NOTIFY_KEY)) === false) return
+    const body = [notice.where, notice.body].filter(Boolean).join(' · ')
+    await orca.host.call('notifications.show', { title: notice.title, body: body || undefined })
+  })
+}
+
+async function noticeOfEvent(orca, event) {
+  const { where, path } = await whereOf(orca, event.workspaceListId)
+  return {
+    id: `${event.paneKey}|${event.state}|${event.receivedAt}`,
+    at: Date.now(),
+    state: event.state,
+    bot: false,
+    title: `${event.title || 'Una sesión'} ${NEEDS_YOU[event.state]}`,
+    where,
+    body: null,
+    path,
+    terminalId: event.terminalId ?? null
+  }
+}
+
+// Mira el Pit Wall cada tanto para avisar de los chats sin terminal, que el evento no cubre.
+function watchChats(orca) {
+  const since = Date.now()
+  let seen = null
+  const tick = async () => {
+    try {
+      const { status, data } = await relay({ path: '/api/pitwall' })
+      if (status !== 200 || data?.error) return // sin datos de Orca no se compara: se perdería el estado anterior
+      const result = chatNotices(seen, data, Date.now(), since)
+      seen = result.seen
+      for (const notice of result.notices) await deliver(orca, notice)
+    } catch (e) {
+      orca.log(`no pude mirar los chats: ${e.message}`)
+    }
+  }
+  tick()
+  setInterval(tick, CHAT_POLL_MS)
 }
 
 export default function activate(orca) {
@@ -120,9 +169,10 @@ export default function activate(orca) {
   orca.events.on('agent.status.changed', async (event) => {
     if (!shouldNotify(lastState, event)) return
     try {
-      await notify(orca, event)
+      await deliver(orca, await noticeOfEvent(orca, event))
     } catch (e) {
       orca.log(`no pude avisar: ${e.message}`)
     }
   })
+  watchChats(orca)
 }

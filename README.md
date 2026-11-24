@@ -10,7 +10,7 @@ Arriba tiene además un tablero al estilo de [Pit Wall](https://github.com/Juanp
 | **Sesiones** | Las que te esperan, las que trabajan, los bots y, plegadas, las terminadas que ya abriste |
 | **Git** | El Source Control |
 
-Cuando una sesión pide permiso o hace una pregunta, avisa con una notificación de escritorio, aunque el panel esté cerrado. La campana «avisos» del panel los apaga. El panel se refresca solo con cada cambio de estado de un agente.
+Cuando una sesión pide permiso o hace una pregunta, o cuando un bot termina, avisa con una notificación de escritorio, aunque el panel esté cerrado. Los chats y bots sin terminal se revisan cada 15 s. La pestaña «Avisos» guarda los últimos 30, con contador de no leídos y clic para ir a la sesión. La campana «avisos» del panel apaga las notificaciones de escritorio; la pestaña los guarda igual. El panel se refresca solo con cada cambio de estado de un agente.
 
 Clic en una sesión lleva a su terminal (o a su workspace, si es un chat sin terminal); en un bot, abre ese bot en Orca. Los contadores de repos llevan a Git con ese filtro. Los datos salen de `worktree.ps` y `agent.list` por el socket de Orca.
 

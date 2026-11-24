@@ -771,7 +771,11 @@ var EVENT_DEBOUNCE_MS = 400
 var NOTIFY_KEY = 'notify'
 var STALE_POLLS = 3
 var WHAT_NOW_MAX = 6
-var VIEWS = ['resumen', 'sesiones', 'git']
+var VIEWS = ['resumen', 'sesiones', 'avisos', 'git']
+// La bandeja que llena el worker (main.mjs) y hasta cuándo la leíste.
+var NOTICES_KEY = 'avisos'
+var NOTICES_READ_KEY = 'avisosLeidos'
+var NOTICES_POLL_MS = 5000
 var STATE = {
   blocked: { tag: 'PERMISO', color: 'var(--c-blocked)', legend: 'pide permiso' },
   waiting: { tag: 'PREGUNTA', color: 'var(--c-waiting)', legend: 'pregunta' },
@@ -791,13 +795,15 @@ var wallError = ''
 var wallOk = 0
 var seen = readSeen()
 var wallRows = {}
+var notices = []
+var noticesRead = 0
 
 function readView() {
   var linked = location.hash.slice(1) // #git, #prs…: abre directo en esa pestaña
-  if (VIEWS.indexOf(linked) >= 0) return linked
+  if (VIEWS.indexOf(linked) >= 0 && (PANEL || linked !== 'avisos')) return linked
   try {
     var v = localStorage.getItem('view')
-    return VIEWS.indexOf(v) >= 0 ? v : 'resumen'
+    return VIEWS.indexOf(v) >= 0 && v !== 'avisos' ? v : 'resumen'
   } catch (e) {
     return 'resumen' // sin almacenamiento arranca en el resumen
   }
@@ -986,13 +992,54 @@ function sessionsView(v) {
     sessionList('Trabajando ahora', wall.working, 'No hay agentes activos.') + botList() +
     (v.looked.length ? '<details><summary>' + heading('Abiertas, ya vistas', v.looked.length) + '</summary>' + v.looked.map(function (a) { return item(a, true) }).join('') + '</details>' : '')
 }
+// ---------- Avisos: lo que el worker te avisó, también lo que no viste en el escritorio ----------
+function unreadNotices() { return notices.filter(function (n) { return n.at > noticesRead }) }
+function noticeItem(n) {
+  var st = STATE[n.state] || STATE.done
+  var unread = n.at > noticesRead
+  var canOpen = n.terminalId || n.path
+  return '<button class="item notice' + (unread ? ' unread' : ' seen') + '" style="--c:' + st.color + '" data-notice="' + esc(n.id) + '"' + (canOpen ? '' : ' disabled') + '>' +
+    '<div class="top"><span class="tag">' + (n.bot ? 'BOT' : st.tag) + '</span><span class="ititle trunc">' + esc(n.title) + '</span><span class="ago">' + ago(n.at) + '</span></div>' +
+    (n.where ? '<div class="sub trunc">' + esc(n.where) + '</div>' : '') + (n.body ? '<div class="msg">“' + esc(n.body) + '”</div>' : '') + '</button>'
+}
+function noticesView() {
+  if (!notices.length) return heading('Avisos', 0) + '<div class="none">Todavía no hay avisos. Llegan cuando una sesión pide permiso o pregunta, y cuando un bot termina.</div>'
+  return heading('Avisos', notices.length) + notices.map(noticeItem).join('') +
+    '<p class="hint">Clic en un aviso → vas a esa sesión. Quedan los últimos 30.</p>'
+}
+function openNotice(id) {
+  var n = notices.filter(function (x) { return x.id === id })[0]
+  if (n) openInOrca(null, n.terminalId, n.path)
+}
+function markNoticesRead() {
+  var last = notices.length ? notices[0].at : 0
+  if (last <= noticesRead) return
+  noticesRead = last
+  store(NOTICES_READ_KEY, noticesRead)
+}
+// La bandeja la escribe el worker: el panel la relee cada tanto y avisa con un cartel lo nuevo.
+function loadNotices() {
+  return Promise.all([orca.storage.get(NOTICES_KEY), orca.storage.get(NOTICES_READ_KEY)]).then(function (v) {
+    var list = Array.isArray(v[0]) ? v[0] : []
+    var read = Math.max(noticesRead, typeof v[1] === 'number' ? v[1] : 0)
+    var before = notices.length ? notices[0].id : null
+    var top = list.length ? list[0] : null
+    var changed = (top ? top.id : null) !== before || read !== noticesRead
+    var fresh = before !== null && top && top.id !== before && top.at > read
+    notices = list
+    noticesRead = read
+    if (view === 'avisos' && !document.hidden) markNoticesRead()
+    else if (fresh) toast('🔔 ' + top.title, true)
+    if (changed) renderBoard()
+  }).catch(function (e) { console.error('[command-deck] no pude leer los avisos', e) })
+}
 function renderTabs(v) {
   var dirty = data.filter(FILTERS.cambios.test).length
   var t = function (id, label, n) {
     return '<button role="tab" data-view="' + id + '" aria-selected="' + (view === id) + '">' + label + (n !== undefined ? '<span class="n">' + n + '</span>' : '') + '</button>'
   }
   document.getElementById('tabs').innerHTML = t('resumen', 'Resumen') + t('sesiones', 'Sesiones', v ? v.kpis.fresh : undefined) +
-    t('git', 'Git', dirty || undefined)
+    (PANEL ? t('avisos', 'Avisos', unreadNotices().length || undefined) : '') + t('git', 'Git', dirty || undefined)
 }
 function renderAlerts() {
   var out = []
@@ -1009,6 +1056,10 @@ function renderBoard() {
   board.hidden = onGit
   if (onGit) return
   wallRows = {}
+  if (view === 'avisos') {
+    boardInner.innerHTML = noticesView()
+    return
+  }
   if (!wall) {
     boardInner.innerHTML = '<p class="hint">Cargando…</p>'
     return
@@ -1048,6 +1099,7 @@ new ResizeObserver(drawWires).observe(board)
 function setView(next) {
   view = next
   store('view', next)
+  if (next === 'avisos') markNoticesRead()
   board.scrollTop = 0
   renderBoard()
   if (next === 'git') render()
@@ -1068,12 +1120,13 @@ function openSession(a) {
   openInOrca(a.worktreeId, a.terminalId, a.path)
 }
 function onBoardClick(e) {
-  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws]')
+  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice]')
   if (!t) return
   if (t.dataset.filter) { filter = t.dataset.filter; find.value = ''; setView('git') }
   else if (t.dataset.view) setView(t.dataset.view)
   else if (t.dataset.row) { if (wallRows[t.dataset.row]) openSession(wallRows[t.dataset.row]) }
   else if (t.dataset.ws) openInOrca(t.dataset.ws, null, t.dataset.path)
+  else if (t.dataset.notice) openNotice(t.dataset.notice)
 }
 board.addEventListener('click', onBoardClick)
 document.getElementById('tabs').addEventListener('click', onBoardClick)
@@ -1145,6 +1198,8 @@ if (PANEL) {
     eventTimer = setTimeout(loadWall, EVENT_DEBOUNCE_MS)
   })
   setupNotifyToggle()
+  loadNotices()
+  setInterval(function () { if (!document.hidden) loadNotices() }, NOTICES_POLL_MS)
 }
 // El botón de la campana: prende o apaga los avisos de escritorio, que manda el worker aunque el panel esté cerrado.
 function setupNotifyToggle() {
@@ -1154,7 +1209,7 @@ function setupNotifyToggle() {
     bell.hidden = false
     bell.className = 'bell' + (on ? ' on' : '')
     bell.textContent = on ? '🔔 avisos' : '🔕 avisos'
-    bell.title = on ? 'Te aviso cuando una sesión pide permiso o pregunta. Clic para apagar.' : 'Avisos apagados. Clic para prender.'
+    bell.title = on ? 'Aviso en el escritorio cuando una sesión pide permiso o pregunta, o un bot termina. Clic para apagar. La pestaña Avisos los guarda igual.' : 'Avisos apagados. Clic para prender.'
   }
   orca.storage.get(NOTIFY_KEY).then(function (v) { on = v !== false; paint() }, function () { paint() })
   bell.onclick = function () {
