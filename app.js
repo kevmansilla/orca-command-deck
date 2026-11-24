@@ -65,6 +65,7 @@ var ICONS = {
   minus: '<path d="M5 12h14"/>',
   trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
   back: '<path d="m15 18-6-6 6-6"/>',
+  close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
   undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>',
   folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
   layers: '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>'
@@ -217,9 +218,6 @@ function paintDiff() {
 }
 function showDiff(title, text) {
   document.getElementById('title').textContent = title
-  document.getElementById('blank').hidden = true
-  document.getElementById('blank').style.display = 'none'
-  document.body.classList.add('detail')
   var pre = document.getElementById('diff')
   pre.hidden = false
   lastDiff = text
@@ -230,17 +228,31 @@ new ResizeObserver(function () {
   var wide = document.getElementById('main').clientWidth >= SPLIT_WIDTH
   if (lastDiff !== null && wide !== splitShown) paintDiff()
 }).observe(document.getElementById('main'))
+// El diff solo ocupa lugar mientras hay algo abierto: sin nada elegido, la lista usa todo el ancho.
+function closeDiff() {
+  if (!document.body.classList.contains('detail')) return false
+  diffRequest++
+  document.body.classList.remove('detail')
+  document.getElementById('diff').hidden = true
+  lastDiff = null
+  if (selected) { selected = ''; render() }
+  return true
+}
 document.getElementById('back').appendChild(svg('back'))
-document.getElementById('back').onclick = function () { document.body.classList.remove('detail') }
+document.getElementById('back').onclick = closeDiff
+document.getElementById('close').appendChild(svg('close'))
+document.getElementById('close').onclick = closeDiff
 // Si se elige otro archivo antes de que llegue la respuesta, gana el último elegido.
 function openDiff(title, query) {
   var request = ++diffRequest
   var heading = document.getElementById('title')
   heading.textContent = 'Cargando…'
+  document.getElementById('diff').hidden = true
+  document.body.classList.add('detail')
   api(query).then(function (j) {
     if (request === diffRequest) showDiff(title, j.diff || 'Sin diferencias de texto')
   }).catch(function (e) {
-    if (request === diffRequest) heading.textContent = ''
+    if (request === diffRequest) closeDiff()
     toast(e.message)
   })
 }
@@ -361,7 +373,13 @@ function historyView(r, wrap) {
 }
 function closeModal() { document.getElementById('modal').style.display = 'none' }
 document.getElementById('modal').onclick = function (e) { if (e.target === this) closeModal() }
-document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal() })
+// Esc cierra primero el diálogo y, si no hay ninguno, el diff.
+document.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return
+  var modal = document.getElementById('modal')
+  if (modal.style.display && modal.style.display !== 'none') closeModal()
+  else if (!/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) closeDiff()
+})
 // El botón que queda con foco siempre es la salida segura.
 function ticketNote(t) {
   var parts = [t.id]
@@ -1067,6 +1085,7 @@ function paintLive() {
   var live = document.getElementById('live')
   live.classList.toggle('off', !ok)
   live.lastChild.textContent = ok ? 'en vivo · ' + new Date().toLocaleTimeString('es-AR', { hour12: false }) : wallOk ? 'sin datos · último hace ' + short(wallOk) : 'sin conexión'
+  live.title = live.lastChild.textContent // en un panel angosto el texto se corta con puntos
 }
 var wallInFlight = false
 function loadWall() {
