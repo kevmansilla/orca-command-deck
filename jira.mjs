@@ -7,7 +7,10 @@ const BRIEF_MAX = 220
 // Un párrafo todo en negrita y corto es un rótulo de sección ("Ejemplo", "Límites"), no la descripción.
 const LABEL_MAX = 80
 const MIN_LINE = 4
-const MAX_RESULTS = 50
+const MAX_RESULTS = 100
+const STALE_DAYS = 90
+const DAY_MS = 86_400_000
+const IN_PROGRESS = 'En curso'
 const FIELDS = 'summary,status,description,updated'
 export const JIRA_TIMEOUT_MS = 20_000
 const PROJECT_RE = /^[A-Z][A-Z0-9_]{0,19}$/
@@ -33,8 +36,38 @@ export function jiraConfig(raw, expand = (p) => p) {
     tickets: typeof raw.tickets === 'string' ? expand(raw.tickets) : null,
     // El primer mensaje del agente al arrancar un ticket: {key}, {title} y {url}.
     startPrompt: typeof raw.startPrompt === 'string' && raw.startPrompt.trim() ? raw.startPrompt : DEFAULT_PROMPT,
-    agent: AGENT_RE.test(raw.agent ?? '') ? raw.agent : 'claude'
+    agent: AGENT_RE.test(raw.agent ?? '') ? raw.agent : 'claude',
+    // Estados que no se muestran (los Done nunca vienen).
+    hideStatuses: names(raw.hideStatuses) ?? ['Testing'],
+    // Estados que van en su propia sección, después de «En curso» y en este orden. Sin lista, los de categoría «new».
+    sections: names(raw.sections),
+    // Lo que no se actualiza hace más de esto va al final de su sección, plegado.
+    staleDays: Number.isFinite(raw.staleDays) && raw.staleDays > 0 ? raw.staleDays : STALE_DAYS
   }
+}
+
+const names = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()) : null)
+const sameName = (list, name) => list.some((x) => x.toLowerCase() === String(name ?? '').toLowerCase())
+
+// Saca los tickets en un estado oculto.
+export const visibleRows = (rows, hide) => rows.filter((r) => !sameName(hide, r.status))
+
+// Las secciones del panel: «En curso» (lo que no está en una sección propia, o tiene workspace en Orca) y una por
+// estado de `order`, en ese orden. Dentro, lo más reciente primero, y lo viejo aparte.
+export function jiraSections(rows, { order = null, staleDays = STALE_DAYS, now = Date.now() } = {}) {
+  const own = order ?? [...new Set(rows.filter((r) => r.category === 'new').map((r) => r.status))]
+  const byId = new Map([[IN_PROGRESS, []], ...own.map((n) => [n.toLowerCase(), []])])
+  for (const r of rows) {
+    const id = !r.sessions.length && sameName(own, r.status) ? String(r.status).toLowerCase() : IN_PROGRESS
+    byId.get(id).push(r)
+  }
+  const limit = now - staleDays * DAY_MS
+  return [IN_PROGRESS, ...own].flatMap((title) => {
+    const list = byId.get(title === IN_PROGRESS ? title : title.toLowerCase()).sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))
+    if (!list.length) return []
+    const old = (r) => !r.sessions.length && r.updated != null && r.updated < limit
+    return [{ id: title, title, keys: list.filter((r) => !old(r)).map((r) => r.key), staleKeys: list.filter(old).map((r) => r.key) }]
+  })
 }
 
 // Un .env simple: CLAVE=valor, con comillas o `export` opcionales.

@@ -201,7 +201,8 @@ function watchChats(orca) {
   setInterval(tick, CHAT_POLL_MS)
 }
 
-// Avisa una vez por cada ticket que te asignan: lo que aparece en la lista y no estaba en la vuelta anterior.
+// Avisa una vez por cada ticket que te asignan: lo que aparece en la lista y no estaba en la vuelta anterior. Compara
+// todos tus tickets, también los de estados ocultos: uno que pasa por Testing y vuelve no es nuevo.
 function watchJira(orca) {
   const tick = async () => {
     try {
@@ -210,10 +211,12 @@ function watchJira(orca) {
       if (status !== 200 || !data?.enabled || data.error) return
       const known = await orca.storage.get(JIRA_KNOWN_KEY)
       const now = Date.now()
-      const result = jiraNews(known && typeof known === 'object' && !Array.isArray(known) ? known : null, data.issues.map((t) => t.key), now)
+      const result = jiraNews(known && typeof known === 'object' && !Array.isArray(known) ? known : null, data.allKeys ?? data.issues.map((t) => t.key), now)
       await orca.storage.set(JIRA_KNOWN_KEY, result.known)
       for (const key of result.fresh) {
+        // Uno que te asignan directo en un estado oculto (Testing) no avisa: tampoco se ve.
         const t = data.issues.find((x) => x.key === key)
+        if (!t) continue
         await deliver(orca, { id: `jira|${key}|${now}`, at: now, state: 'jira', jira: true, bot: false, title: `Ticket nuevo: ${key}`, where: t.title, body: t.brief, path: null, terminalId: null })
       }
     } catch (e) {

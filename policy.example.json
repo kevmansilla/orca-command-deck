@@ -55,6 +55,9 @@
     "project": "ABC",
     "credentials": "~/.config/jira/credenciales.env",
     "tickets": "~/trabajo/tickets",
-    "startPrompt": "Arrancamos {key}: {title}. Leé el ticket en Jira: {url}"
+    "startPrompt": "Arrancamos {key}: {title}. Leé el ticket en Jira: {url}",
+    "hideStatuses": ["Testing"],
+    "sections": ["Bloqueado", "Por hacer", "Borrador"],
+    "staleDays": 90
   }
 }

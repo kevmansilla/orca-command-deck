@@ -281,3 +281,6 @@ a.commit { display:flex; align-items:center; justify-content:center; text-decora
 .item.ticket .tag { font-size:9px; }
 .item.ticket .msg { font-style:normal; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; white-space:normal; }
 .opt-h { padding:6px 8px 2px; font:600 9px var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+button.label-h.fold { width:100%; padding:0; border:0; background:none; cursor:pointer; text-align:left; }
+button.label-h.fold:hover { color:var(--fg); }
+button.label-h.fold.sub { margin:10px 0 6px; letter-spacing:.06em; text-transform:none; font-weight:400; }

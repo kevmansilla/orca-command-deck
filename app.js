@@ -778,6 +778,7 @@ var JIRA_POLL_MS = 60000
 var JIRA_KNOWN_KEY = 'jiraConocidos'
 var JIRA_SEEN_KEY = 'jiraVisto'
 var JIRA_REQUEST_MS = 180000
+var JIRA_FOLDED_KEY = 'jiraPlegadas'
 // La bandeja que llena el worker (main.mjs) y hasta cuándo la leíste.
 var NOTICES_KEY = 'avisos'
 var NOTICES_READ_KEY = 'avisosLeidos'
@@ -808,6 +809,7 @@ var jiraError = ''
 var jiraKnown = {}
 var jiraSeen = 0
 var jiraSeenShown = 0
+var jiraFolded = {}
 
 function readView() {
   var linked = location.hash.slice(1) // #git, #prs…: abre directo en esa pestaña
@@ -838,12 +840,13 @@ function store(key, value) {
 // Lo guardado en el panel llega después del primer dibujo.
 function restorePanelState() {
   if (!PANEL) return Promise.resolve()
-  return Promise.all(['seen', 'view', 'closedSpaces', 'zoom', JIRA_SEEN_KEY].map(function (k) { return orca.storage.get(k).catch(function () { return null }) })).then(function (v) {
+  return Promise.all(['seen', 'view', 'closedSpaces', 'zoom', JIRA_SEEN_KEY, JIRA_FOLDED_KEY].map(function (k) { return orca.storage.get(k).catch(function () { return null }) })).then(function (v) {
     if (v[0] && typeof v[0] === 'object') seen = v[0]
     if (VIEWS.indexOf(v[1]) >= 0) view = v[1]
     if (v[2] && typeof v[2] === 'object') closedSpaces = v[2]
     if (typeof v[3] === 'number') setZoom(v[3], false)
     if (typeof v[4] === 'number') jiraSeen = v[4]
+    if (v[5] && typeof v[5] === 'object') jiraFolded = v[5]
     if (view === 'jira') markJiraSeen()
     renderBoard()
     render()
@@ -1041,9 +1044,9 @@ function harnessChip(h) {
   if (!h) return ''
   if (h.deployed) return chip('deployado', 'var(--c-done)', 'Según el harness')
   if (h.state === 'listo-para-deploy') return chip('listo para deploy', 'var(--c-waiting)', 'Según el harness')
-  return h.state ? chip(h.state, 'var(--muted)', 'Estado en el harness') : ''
+  return h.state ? chip('harness: ' + h.state, 'var(--muted)', 'Estado en el harness') : '' // «nuevo» solo, se confundía con el chip de asignado
 }
-function ticketItem(t, fresh) {
+function ticketItem(t, fresh, dim) {
   var s = t.sessions[0]
   var stuck = /bloque/i.test(t.status || '')
   var color = fresh ? 'var(--c-waiting)' : s ? 'var(--c-working)' : stuck ? 'var(--c-blocked)' : 'var(--c-idle)'
@@ -1055,24 +1058,40 @@ function ticketItem(t, fresh) {
   if (t.blocker) chips.push(chip('⛔ decisión de negocio', 'var(--c-blocked)', t.blocker))
   if (!s && PANEL) chips.push('<button class="pchip" data-tstart="' + esc(t.key) + '" title="Workspace nuevo en Orca, con la rama del ticket">▶ Arrancar</button>')
   chips.push('<button class="pchip" data-tjira="' + esc(t.key) + '" title="Abrir en Jira">Jira ↗</button>')
-  return '<div class="item ticket' + (fresh ? ' unread' : '') + '" style="--c:' + color + '" data-ticket="' + esc(t.key) + '" title="' + esc(t.title) + '">' +
+  return '<div class="item ticket' + (fresh ? ' unread' : '') + (dim ? ' seen' : '') + '" style="--c:' + color + '" data-ticket="' + esc(t.key) + '" title="' + esc(t.title) + '">' +
     '<div class="top"><span class="tag">' + esc(t.key) + '</span><span class="ititle trunc">' + (t.blocker ? '⛔ ' : '') + esc(t.title) + '</span><span class="ago">' + ago(t.updated) + '</span></div>' +
     (t.brief ? '<div class="msg">' + esc(t.brief) + '</div>' : '') + '<div class="pchips">' + chips.join('') + '</div></div>'
 }
-function ticketGroup(title, rows, fresh) {
-  return rows.length ? heading(title, rows.length) + rows.map(function (t) { return ticketItem(t, fresh) }).join('') : ''
+// Secciones plegables, por estado. Lo plegado se guarda; «viejos» arranca plegado.
+function isFolded(id) { return id in jiraFolded ? jiraFolded[id] : /\|viejos$/.test(id) }
+function foldHeading(id, title, n, cls) {
+  return '<button class="label-h fold' + (isFolded(id) ? ' folded' : '') + (cls ? ' ' + cls : '') + '" data-jfold="' + esc(id) + '"><span>' + (isFolded(id) ? '▸ ' : '▾ ') + esc(title) + '</span><span>' + n + '</span></button>'
+}
+function toggleFold(id) {
+  jiraFolded[id] = !isFolded(id)
+  store(JIRA_FOLDED_KEY, jiraFolded)
+  renderBoard()
+}
+function ticketRows(keys, dim) {
+  return keys.map(ticketOf).filter(Boolean).map(function (t) { return ticketItem(t, isNewTicket(t, jiraSeenShown), dim) }).join('')
+}
+function ticketSection(sec) {
+  var n = sec.keys.length + sec.staleKeys.length
+  var out = foldHeading(sec.id, sec.title, n)
+  if (isFolded(sec.id)) return out
+  out += ticketRows(sec.keys, false)
+  if (!sec.staleKeys.length) return out
+  var oldId = sec.id + '|viejos'
+  out += foldHeading(oldId, plural(sec.staleKeys.length, 'viejo', 'viejos') + ' · más de ' + jira.staleDays + ' días sin cambios', '', 'sub')
+  return out + (isFolded(oldId) ? '' : ticketRows(sec.staleKeys, true))
 }
 function jiraView() {
   if (!jira) return jiraError ? '<div class="none">' + esc(jiraError) + '</div>' : '<p class="hint">Cargando…</p>'
   if (!jira.enabled) return heading('Jira', 0) + '<div class="none">Sin configurar: agregá «jira» a policy.json (mirá policy.example.json).</div>'
   var out = ''
   if (jira.error) out += '<div class="alert" style="--c:var(--c-waiting)">No pude consultar Jira: ' + esc(jira.error) + (jira.fetchedAt ? ' Muestro lo de hace ' + short(jira.fetchedAt) + '.' : '') + '</div>'
-  var fresh = jira.issues.filter(function (t) { return isNewTicket(t, jiraSeenShown) })
-  var rest = jira.issues.filter(function (t) { return !isNewTicket(t, jiraSeenShown) })
-  var working = rest.filter(function (t) { return t.sessions.length })
-  var others = rest.filter(function (t) { return !t.sessions.length })
   if (!jira.issues.length) out += heading('Mis tickets · ' + jira.project, 0) + '<div class="none">No tenés tickets abiertos en ' + esc(jira.project) + '.</div>'
-  out += ticketGroup('Nuevos', fresh, true) + ticketGroup('Trabajando', working, false) + ticketGroup('Asignados · ' + jira.project, others, false)
+  out += (jira.sections || []).map(ticketSection).join('')
   return out + '<p class="hint">Clic en un ticket → su sesión en Orca, o Jira si no tiene. Jira se consulta cada 5 min' + (jira.fetchedAt ? ' · última hace ' + short(jira.fetchedAt) : '') + '.</p>'
 }
 function ticketOf(key) { return jira && jira.issues ? jira.issues.filter(function (t) { return t.key === key })[0] : null }
@@ -1266,8 +1285,9 @@ function openSession(a) {
   openInOrca(a.worktreeId, a.terminalId, a.path)
 }
 function onBoardClick(e) {
-  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice],[data-tjira],[data-tstart],[data-tsession],[data-ticket]')
+  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice],[data-tjira],[data-tstart],[data-tsession],[data-ticket],[data-jfold]')
   if (!t) return
+  if (t.dataset.jfold) return toggleFold(t.dataset.jfold)
   if (t.dataset.tjira) return openTicket(t.dataset.tjira, true)
   if (t.dataset.tstart) return startPicker(t.dataset.tstart)
   if (t.dataset.tsession || t.dataset.ticket) return openTicket(t.dataset.tsession || t.dataset.ticket, false)

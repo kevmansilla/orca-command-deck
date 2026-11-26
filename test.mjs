@@ -112,6 +112,7 @@ const jiraFalso = async (url, init) => {
   jiraPedidos.push({ url, auth: init.headers.Authorization })
   return new Response(JSON.stringify({ issues: [
     { key: 'ABC-8', fields: { summary: 'Revisar el envío de mails', updated: '2026-01-02T10:00:00.000-0300', status: { name: 'To Do', statusCategory: { key: 'new' } }, description: adf({ type: 'heading', content: [{ type: 'text', text: 'Contexto' }] }, parrafo('Ejemplo', true), parrafo('Hay que mandar los mails desde un solo lugar.'), { type: 'codeBlock', content: [{ type: 'text', text: 'select 1' }] }) } },
+    { key: 'ABC-9', fields: { summary: 'En pruebas', updated: '2026-01-03T10:00:00.000-0300', status: { name: 'Testing', statusCategory: { key: 'indeterminate' } }, description: null } },
     { key: 'ABC-7', fields: { summary: 'Prueba', updated: '2026-01-01T10:00:00.000-0300', status: { name: 'En curso', statusCategory: { key: 'indeterminate' } }, description: null } }
   ] }), { status: 200 })
 }
@@ -332,6 +333,7 @@ try {
 
   // Jira
   const { adfLines, blockerIn, branchFor, briefOf, jiraConfig, jiraNews, parseEnv, sessionsOf, slugOf } = await import('./jira.mjs')
+  check('jira: por defecto oculta Testing y separa lo de más de 90 días', jiraConfig({ site: 'https://x.test', project: 'ABC', credentials: 'c' }).hideStatuses.join() === 'Testing' && jiraConfig({ site: 'https://x.test', project: 'ABC', credentials: 'c', staleDays: 30, hideStatuses: [] }).staleDays === 30)
   check('jira: sin https o sin proyecto válido no hay configuración', jiraConfig({ site: 'http://x.test', project: 'ABC', credentials: 'c' }) === null && jiraConfig({ site: 'https://x.test', project: 'abc', credentials: 'c' }) === null)
   check('jira: lee el .env con comillas y export', parseEnv('A="1"\nexport B=\'2\'\n# nada').A === '1' && parseEnv('export B=\'2\'').B === '2')
   check('jira: la descripción breve saltea títulos, rótulos en negrita y código', briefOf(adf({ type: 'heading', content: [{ type: 'text', text: 'Título' }] }, parrafo('Ejemplo', true), parrafo('Hacer esto.'), { type: 'codeBlock', content: [{ type: 'text', text: 'x' }] }, parrafo('Y aquello.'))) === 'Hacer esto. Y aquello.')
@@ -342,6 +344,14 @@ try {
   const sesiones12 = sessionsOf('ABC-12', conRamas)
   check('jira: el workspace se reconoce por la rama, sin confundir ABC-12 con ABC-123 ni contar bots', sesiones12.length === 1 && sesiones12[0].terminalId === 'term_1' && sesiones12[0].agentWorking)
   check('jira: la traba abierta se lee de la línea ⛔ y la resuelta no cuenta', blockerIn('- ⛔ **Decisión de negocio:** el texto') === 'el texto' && blockerIn('✅ Decisión de negocio resuelta: listo') === null)
+  const { jiraSections, visibleRows } = await import('./jira.mjs')
+  const dia = 86_400_000
+  const filaJ = (key, status, dias, o = {}) => ({ key, status, category: status === 'Draft' ? 'new' : 'indeterminate', updated: 1000 * dia - dias * dia, sessions: [], ...o })
+  const filasJ = [filaJ('A-1', 'To Do', 254), filaJ('A-2', 'To Do', 3), filaJ('A-3', 'Bloqueados', 1), filaJ('A-4', 'Revisión', 5), filaJ('A-5', 'Draft', 2), filaJ('A-6', 'Draft', 1, { sessions: [{}] }), filaJ('A-7', 'testing', 1)]
+  check('jira: oculta los estados configurados, sin importar mayúsculas', visibleRows(filasJ, ['Testing']).map((r) => r.key).join() === 'A-1,A-2,A-3,A-4,A-5,A-6')
+  const secs = jiraSections(visibleRows(filasJ, ['Testing']), { order: ['Bloqueados', 'To Do', 'Draft'], staleDays: 90, now: 1000 * dia })
+  check('jira: una sección por estado en el orden pedido, con workspace o en otro estado van a En curso', secs.map((x) => `${x.title}:${x.keys.join('+')}`).join() === 'En curso:A-6+A-4,Bloqueados:A-3,To Do:A-2,Draft:A-5')
+  check('jira: lo que no cambia hace más de 90 días va aparte', secs.find((x) => x.title === 'To Do').staleKeys.join() === 'A-1')
   const n0 = jiraNews(null, ['ABC-1'], 10)
   check('jira: la primera vuelta solo toma nota', n0.fresh.length === 0 && n0.known['ABC-1'] === 0)
   const n1 = jiraNews(n0.known, ['ABC-1', 'ABC-2'], 20)
@@ -354,7 +364,9 @@ try {
   const [codigoJira, mios] = await call('/api/jira')
   const t8 = mios.issues?.find((t) => t.key === 'ABC-8')
   const t7 = mios.issues?.find((t) => t.key === 'ABC-7')
-  check('/api/jira devuelve tus tickets, con workspace primero', codigoJira === 200 && mios.enabled && mios.error === null && mios.issues.map((t) => t.key).join() === 'ABC-7,ABC-8')
+  check('/api/jira devuelve tus tickets, con workspace primero y sin los de Testing', codigoJira === 200 && mios.enabled && mios.error === null && mios.issues.map((t) => t.key).join() === 'ABC-7,ABC-8')
+  check('/api/jira compara todos tus tickets para avisar, también los ocultos', [...mios.allKeys].sort().join() === 'ABC-7,ABC-8,ABC-9')
+  check('/api/jira agrupa: en curso (con workspace) primero, después los de categoría new', mios.sections.map((x) => `${x.title}:${x.keys.join('+')}/${x.staleKeys.join('+')}`).join() === 'En curso:ABC-7/,To Do:/ABC-8')
   check('/api/jira arma la descripción breve y el link', t8.brief === 'Hay que mandar los mails desde un solo lugar.' && t8.url === 'https://jira.example.test/browse/ABC-8')
   check('/api/jira marca el ticket que tiene workspace en Orca', t7.sessions.length === 1 && t7.sessions[0].worktreeId === 'r1::/p/abc7' && t8.sessions.length === 0)
   check('/api/jira suma el estado del harness y la traba', t8.harness.state === 'listo-para-deploy' && !t8.harness.deployed && t8.blocker?.startsWith('qué texto ve el cliente') && t7.harness.state === 'en-progreso' && t7.blocker === null)

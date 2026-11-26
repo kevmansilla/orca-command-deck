@@ -109,9 +109,14 @@ Con `"jira"` en `policy.json` aparece la pestaña **Jira**: los tickets del proy
   "project": "ABC",
   "credentials": "~/.config/jira/credenciales.env",
   "tickets": "~/trabajo/tickets",
-  "startPrompt": "Arrancamos {key}: {title}. Leé el ticket en Jira: {url}"
+  "startPrompt": "Arrancamos {key}: {title}. Leé el ticket en Jira: {url}",
+  "hideStatuses": ["Testing"],
+  "sections": ["Bloqueado", "Por hacer", "Borrador"],
+  "staleDays": 90
 }
 ```
+
+- Los tickets van en secciones plegables: **En curso** (los estados que no están en `sections`, y todo ticket con workspace en Orca) y después una por cada estado de `sections`, en ese orden (sin `sections`, una por cada estado de categoría «por hacer» de Jira). Dentro, lo más reciente primero; lo que no cambia hace más de `staleDays` días (90 por defecto) va al final, atenuado y plegado. `hideStatuses` oculta esos estados (por defecto `Testing`).
 
 - `credentials` es un archivo con `JIRA_EMAIL` y `JIRA_TOKEN` (un token de API de Atlassian). Lo lee solo el servidor local: el token no llega al panel ni a los logs. La consulta es de solo lectura y sale como mucho cada 5 minutos; si falla, el panel muestra lo último que llegó, con el aviso.
 - Un ticket cuya rama (`ABC-12-algo`) tiene un workspace en Orca dice «trabajando», y el clic lleva a esa sesión.

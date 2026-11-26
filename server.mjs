@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { activateWorktree, focusTerminal, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
-import { BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fillPrompt, jiraConfig, jiraRows, pushedIn } from './jira.mjs'
+import { BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fillPrompt, jiraConfig, jiraRows, jiraSections, pushedIn, visibleRows } from './jira.mjs'
 import { buildSnapshot, isTerminal } from './pitwall.mjs'
 
 const HOME = homedir()
@@ -801,8 +801,10 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     } catch {
       // Sin la lista de repos no se marca "rama pusheada"; lo demás sale igual.
     }
-    const issues = jiraRows(state.issues, { site: cfg.site, worktrees, extra: (key) => ({ ...harnessOf(cfg.tickets, key), pushed: pushedIn(key, remotes) }) })
-    return { enabled: true, project: cfg.project, fetchedAt: state.fetchedAt, error: state.error, issues }
+    const all = jiraRows(state.issues, { site: cfg.site, worktrees, extra: (key) => ({ ...harnessOf(cfg.tickets, key), pushed: pushedIn(key, remotes) }) })
+    const issues = visibleRows(all, cfg.hideStatuses)
+    const sections = jiraSections(issues, { order: cfg.sections, staleDays: cfg.staleDays })
+    return { enabled: true, project: cfg.project, fetchedAt: state.fetchedAt, error: state.error, staleDays: cfg.staleDays, issues, sections, allKeys: all.map((t) => t.key) }
   }
 
   // Lo que hace falta para arrancar un ticket en un repo: la rama nueva, de qué base sale y el primer mensaje. No escribe
