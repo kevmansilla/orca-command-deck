@@ -49,5 +49,12 @@
     "under": "~/trabajo",
     "create": "git mi-worktree {repo} {branch}",
     "remove": "git mi-worktree -d {repo} {branch}"
+  },
+  "jira": {
+    "site": "https://mi-empresa.atlassian.net",
+    "project": "ABC",
+    "credentials": "~/.config/jira/credenciales.env",
+    "tickets": "~/trabajo/tickets",
+    "startPrompt": "Arrancamos {key}: {title}. Leé el ticket en Jira: {url}"
   }
 }

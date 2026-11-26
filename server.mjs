@@ -9,6 +9,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { activateWorktree, focusTerminal, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
+import { BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fillPrompt, jiraConfig, jiraRows, pushedIn } from './jira.mjs'
 import { buildSnapshot, isTerminal } from './pitwall.mjs'
 
 const HOME = homedir()
@@ -39,6 +40,13 @@ const QUIET_CHECK_MS = 20_000
 const ACTIVE_MS = 2 * 60_000
 // La pestaña consulta Pit Wall cada pocos segundos: dentro de esta ventana se reusa la última respuesta de Orca.
 const PITWALL_CACHE_MS = 2_000
+// Jira se consulta como mucho cada 5 minutos; las ramas del remoto (del último fetch, sin fetch nuevo), cada 2.
+const JIRA_CACHE_MS = 5 * 60_000
+const REMOTE_REFS_MS = 2 * 60_000
+const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]+-\d+$/
+const HARNESS_STATES = ['nuevo', 'planificado', 'en-progreso', 'en-review', 'en-correccion', 'listo-para-probar', 'listo-para-deploy', 'desplegado', 'bloqueado', 'descartado']
+const INLINE_STATE_RE = /\*\*Estado:\*\*\s*`?([a-z][a-z-]*[a-z])/
+const DEPLOYED_RE = /^- \*\*Estado:\*\*\s*`?ejecutado/m
 // Solo pide confirmación: un falso positivo cuesta un clic, y un secreto subido no se puede deshacer.
 const SENSITIVE_RE = /(^|\/)(\.env(\.(?!example$|sample$|template$|dist$)[^/]+)?|\.netrc|\.npmrc|\.pgpass|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)|credentials(\.[^/]+)?|secrets?(\.[^/]+)?|[^/]+\.(pem|key|p12|pfx|jks|keystore|tfstate|tfvars))$/i
 
@@ -231,7 +239,8 @@ function readPolicy() {
     commands: (Array.isArray(data?.commands) ? data.commands : []).map(scoped),
     worktrees: data?.worktrees ? scoped(data.worktrees) : null,
     tickets: (Array.isArray(data?.tickets) ? data.tickets : []).map((t) => ({ ...scoped(t), dir: t.dir && expandHome(t.dir) })),
-    scan: data?.scan?.run ? { ...scoped(data.scan), run: expandHome(data.scan.run) } : null
+    scan: data?.scan?.run ? { ...scoped(data.scan), run: expandHome(data.scan.run) } : null,
+    jira: jiraConfig(data?.jira, expandHome)
   }
 }
 
@@ -302,8 +311,32 @@ function ticketOf(root, branch) {
     id,
     state: TICKET_STATE_RE.exec(readText(join(folder, 'US.md')) ?? '')?.[1] ?? null,
     testMissing: !ownLines(readText(join(folder, 'test.md')), template('test.md')).length,
-    deployPending: ownLines(deploy, template('deploy.md')).length > 0 && !/^- \*\*Estado:\*\*\s*`?ejecutado/m.test(deploy)
+    deployPending: ownLines(deploy, template('deploy.md')).length > 0 && !DEPLOYED_RE.test(deploy)
   }
+}
+
+// El estado del ticket en el harness: la viñeta de US.md; si no, el campo en línea («· **Estado:** desplegado ·»); si
+// no, su fila de INDEX.md. Solo cuentan los estados fijos.
+function stateOf(dir, key, us) {
+  const known = (v) => (HARNESS_STATES.includes(v) ? v : null)
+  const bullet = known(TICKET_STATE_RE.exec(us)?.[1] ?? null)
+  if (bullet) return bullet
+  const inline = known(INLINE_STATE_RE.exec(us)?.[1] ?? null)
+  if (inline) return inline
+  const row = (readText(join(dir, 'INDEX.md')) ?? '').split('\n').find((l) => l.startsWith(`| ${key} |`))
+  return row?.match(/`([a-z-]+)`/g)?.map((t) => t.slice(1, -1)).find(known) ?? null
+}
+
+// Lo que el harness asienta de un ticket de Jira: su estado (US.md), si el deploy se ejecutó y la traba de negocio
+// abierta, si tiene. Los archivados no traban.
+function harnessOf(dir, key) {
+  const folder = dir ? ticketFolder(dir, key) : null
+  if (!folder) return { blocker: null, harness: null }
+  const archived = basename(dirname(folder)) === '_archivo'
+  const state = stateOf(dir, key, readText(join(folder, 'US.md')) ?? '')
+  const deployed = state === 'desplegado' || DEPLOYED_RE.test(readText(join(folder, 'deploy.md')) ?? '')
+  const blocker = archived ? null : BLOCKER_FILES.map((f) => blockerIn(readText(join(folder, f)))).find(Boolean) ?? null
+  return { blocker, harness: { state, deployed } }
 }
 
 // Solo las líneas agregadas: lo que ya estaba en el repo no es parte de este push.
@@ -697,7 +730,7 @@ function botDirs() {
 
 const ORCA = { worktrees: orcaWorktrees, sessions: openSessions, bots: botDirs, focus: focusTerminal, activate: activateWorktree }
 
-export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTerminal, orca = ORCA } = {}) {
+export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTerminal, orca = ORCA, jiraFetch = fetch } = {}) {
   const token = process.env.MRG_TOKEN ?? randomBytes(32).toString('base64url')
   // Se lee una sola vez: si el plugin se actualiza, un servidor viejo no debe servir una página que no sabe atender.
   const page = readFileSync(INDEX)
@@ -707,6 +740,9 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
   let lastUse = Date.now()
   let lastFetch = 0
   let pitwall = null
+  let jira = null
+  let jiraLoading = null
+  let remoteRefs = null
 
   async function pitwallSnapshot() {
     if (pitwall && Date.now() - pitwall.at < PITWALL_CACHE_MS) return pitwall.data
@@ -720,6 +756,78 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     }
     pitwall = { at: Date.now(), data }
     return data
+  }
+
+  // Tus tickets, de la caché si es reciente. Si Jira falla, queda lo último que respondió, con el error.
+  async function jiraIssues(cfg) {
+    const id = `${cfg.site}|${cfg.project}|${cfg.credentials}`
+    if (jira?.id === id && Date.now() - jira.at < JIRA_CACHE_MS) return jira
+    jiraLoading ??= fetchMyIssues(cfg, jiraFetch).then(
+      (issues) => { jira = { id, at: Date.now(), fetchedAt: Date.now(), issues, error: null } },
+      (e) => {
+        const prev = jira?.id === id ? jira : null
+        jira = { id, at: Date.now(), fetchedAt: prev?.fetchedAt ?? null, issues: prev?.issues ?? [], error: e.message }
+      }
+    ).finally(() => { jiraLoading = null })
+    await jiraLoading
+    return jira
+  }
+
+  // Las ramas de origin de cada repo, tal como quedaron del último fetch. Solo lectura.
+  async function ticketRemotes() {
+    if (remoteRefs && Date.now() - remoteRefs.at < REMOTE_REFS_MS) return remoteRefs.data
+    const roots = listRepos().filter((r) => !r.worktreeOf)
+    const data = await Promise.all(roots.map(async (r) => ({
+      repo: r.name,
+      branches: (await git(r.path, 'for-each-ref', '--format=%(refname:lstrip=3)', 'refs/remotes/origin')).split('\n').filter(Boolean)
+    })))
+    remoteRefs = { at: Date.now(), data }
+    return data
+  }
+
+  async function jiraView() {
+    const cfg = readPolicy().jira
+    if (!cfg) return { enabled: false }
+    const state = await jiraIssues(cfg)
+    let worktrees = []
+    try {
+      worktrees = await orca.worktrees()
+    } catch {
+      // Sin Orca no se sabe qué tickets tienen workspace; la lista sale igual.
+    }
+    let remotes = []
+    try {
+      remotes = await ticketRemotes()
+    } catch {
+      // Sin la lista de repos no se marca "rama pusheada"; lo demás sale igual.
+    }
+    const issues = jiraRows(state.issues, { site: cfg.site, worktrees, extra: (key) => ({ ...harnessOf(cfg.tickets, key), pushed: pushedIn(key, remotes) }) })
+    return { enabled: true, project: cfg.project, fetchedAt: state.fetchedAt, error: state.error, issues }
+  }
+
+  // Lo que hace falta para arrancar un ticket en un repo: la rama nueva, de qué base sale y el primer mensaje. No escribe
+  // nada: el worker crea el workspace con esto, después de que confirmás.
+  async function jiraStartPlan(key, repoKey) {
+    const cfg = readPolicy().jira
+    if (!cfg) throw new ActionError('Jira no está configurado.')
+    if (!JIRA_KEY_RE.test(key ?? '')) throw new ActionError('Ticket inválido.')
+    const issue = (await jiraIssues(cfg)).issues.find((i) => i.key === key)
+    if (!issue) throw new ActionError('Ese ticket no está entre los tuyos.')
+    const item = listRepos().find((r) => r.key === repoKey && !r.worktreeOf)
+    if (!item) throw new ActionError('Repo desconocido.')
+    const { base, blocked } = await policy(item.path)
+    const title = issue.fields?.summary ?? key
+    const branch = branchFor(key, title)
+    if (branch === base || blocked.has(branch)) throw new ActionError('Esa rama está protegida.')
+    const refs = (await git(item.path, 'for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes/origin')).split('\n').filter(Boolean)
+    if (!refs.includes(`refs/remotes/origin/${base}`)) throw new ActionError(`No encuentro origin/${base} en ${item.name}: hacé fetch.`)
+    if (refs.includes(`refs/heads/${branch}`) || refs.includes(`refs/remotes/origin/${branch}`)) throw new ActionError(`La rama ${branch} ya existe en ${item.name}.`)
+    const same = new RegExp(`^${key}(?:-|$)`, 'i')
+    const existing = refs.map((r) => r.replace(/^refs\/(heads|remotes)\//, '')).filter((b) => same.test(b.replace(/^origin\//, '')))
+    return {
+      key, title, repo: item.name, group: item.group ?? '', path: item.path, base, baseRef: `origin/${base}`, branch, existing, agent: cfg.agent,
+      prompt: fillPrompt(cfg.startPrompt, { key, title, url: `${cfg.site}/browse/${key}` })
+    }
   }
 
   // Solo lleva a una sesión o a un workspace que Orca acaba de listar: el id viene de la página.
@@ -808,6 +916,8 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     lastUse = Date.now()
     if (url.pathname === '/api/ping') return reply(res, 200, { ok: true })
     if (url.pathname === '/api/pitwall') return reply(res, 200, await pitwallSnapshot())
+    if (url.pathname === '/api/jira') return reply(res, 200, await jiraView())
+    if (url.pathname === '/api/jira-start') return reply(res, 200, await jiraStartPlan(q.get('key'), q.get('repo')))
     if (url.pathname === '/api/repos') {
       if (q.get('fresh') === '1') expireSummaries()
       const items = []

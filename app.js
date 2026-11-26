@@ -771,7 +771,13 @@ var EVENT_DEBOUNCE_MS = 400
 var NOTIFY_KEY = 'notify'
 var STALE_POLLS = 3
 var WHAT_NOW_MAX = 6
-var VIEWS = ['resumen', 'sesiones', 'avisos', 'git']
+var VIEWS = ['resumen', 'sesiones', 'avisos', 'jira', 'git']
+// Tus tickets: el servidor consulta Jira como mucho cada 5 min; esto solo lee su caché. El worker anota en
+// jiraConocidos cuándo apareció cada ticket, y jiraVisto es hasta cuándo miraste la pestaña.
+var JIRA_POLL_MS = 60000
+var JIRA_KNOWN_KEY = 'jiraConocidos'
+var JIRA_SEEN_KEY = 'jiraVisto'
+var JIRA_REQUEST_MS = 180000
 // La bandeja que llena el worker (main.mjs) y hasta cuándo la leíste.
 var NOTICES_KEY = 'avisos'
 var NOTICES_READ_KEY = 'avisosLeidos'
@@ -797,6 +803,11 @@ var seen = readSeen()
 var wallRows = {}
 var notices = []
 var noticesRead = 0
+var jira = null
+var jiraError = ''
+var jiraKnown = {}
+var jiraSeen = 0
+var jiraSeenShown = 0
 
 function readView() {
   var linked = location.hash.slice(1) // #git, #prs…: abre directo en esa pestaña
@@ -827,11 +838,13 @@ function store(key, value) {
 // Lo guardado en el panel llega después del primer dibujo.
 function restorePanelState() {
   if (!PANEL) return Promise.resolve()
-  return Promise.all(['seen', 'view', 'closedSpaces', 'zoom'].map(function (k) { return orca.storage.get(k).catch(function () { return null }) })).then(function (v) {
+  return Promise.all(['seen', 'view', 'closedSpaces', 'zoom', JIRA_SEEN_KEY].map(function (k) { return orca.storage.get(k).catch(function () { return null }) })).then(function (v) {
     if (v[0] && typeof v[0] === 'object') seen = v[0]
     if (VIEWS.indexOf(v[1]) >= 0) view = v[1]
     if (v[2] && typeof v[2] === 'object') closedSpaces = v[2]
     if (typeof v[3] === 'number') setZoom(v[3], false)
+    if (typeof v[4] === 'number') jiraSeen = v[4]
+    if (view === 'jira') markJiraSeen()
     renderBoard()
     render()
   })
@@ -995,21 +1008,146 @@ function sessionsView(v) {
 // ---------- Avisos: lo que el worker te avisó, también lo que no viste en el escritorio ----------
 function unreadNotices() { return notices.filter(function (n) { return n.at > noticesRead }) }
 function noticeItem(n) {
-  var st = STATE[n.state] || STATE.done
+  var st = n.jira ? { tag: 'JIRA', color: 'var(--info)' } : STATE[n.state] || STATE.done
   var unread = n.at > noticesRead
-  var canOpen = n.terminalId || n.path
+  var canOpen = n.terminalId || n.path || n.jira
   return '<button class="item notice' + (unread ? ' unread' : ' seen') + '" style="--c:' + st.color + '" data-notice="' + esc(n.id) + '"' + (canOpen ? '' : ' disabled') + '>' +
     '<div class="top"><span class="tag">' + (n.bot ? 'BOT' : st.tag) + '</span><span class="ititle trunc">' + esc(n.title) + '</span><span class="ago">' + ago(n.at) + '</span></div>' +
     (n.where ? '<div class="sub trunc">' + esc(n.where) + '</div>' : '') + (n.body ? '<div class="msg">“' + esc(n.body) + '”</div>' : '') + '</button>'
 }
 function noticesView() {
-  if (!notices.length) return heading('Avisos', 0) + '<div class="none">Todavía no hay avisos. Llegan cuando una sesión pide permiso o pregunta, y cuando un bot termina.</div>'
+  if (!notices.length) return heading('Avisos', 0) + '<div class="none">Todavía no hay avisos. Llegan cuando una sesión pide permiso o pregunta, cuando un bot termina y cuando te asignan un ticket.</div>'
   return heading('Avisos', notices.length) + notices.map(noticeItem).join('') +
     '<p class="hint">Clic en un aviso → vas a esa sesión. Quedan los últimos 30.</p>'
 }
 function openNotice(id) {
   var n = notices.filter(function (x) { return x.id === id })[0]
-  if (n) openInOrca(null, n.terminalId, n.path)
+  if (n && n.jira) setView('jira')
+  else if (n) openInOrca(null, n.terminalId, n.path)
+}
+// ---------- Jira: tus tickets, cuáles trabajás, el estado del harness y cómo arrancar uno ----------
+function isNewTicket(t, since) { return (jiraKnown[t.key] || 0) > since }
+function jiraUnseen() { return jira && jira.enabled ? jira.issues.filter(function (t) { return isNewTicket(t, jiraSeen) }).length : 0 }
+function markJiraSeen() {
+  jiraSeenShown = jiraSeen
+  jiraSeen = Date.now()
+  store(JIRA_SEEN_KEY, jiraSeen)
+}
+var JIRA_CATEGORY = { new: 'var(--muted)', indeterminate: 'var(--info)', done: 'var(--c-done)' }
+function chip(text, color, title) {
+  return '<span class="pchip c" style="--c:' + color + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(text) + '</span>'
+}
+function harnessChip(h) {
+  if (!h) return ''
+  if (h.deployed) return chip('deployado', 'var(--c-done)', 'Según el harness')
+  if (h.state === 'listo-para-deploy') return chip('listo para deploy', 'var(--c-waiting)', 'Según el harness')
+  return h.state ? chip(h.state, 'var(--muted)', 'Estado en el harness') : ''
+}
+function ticketItem(t, fresh) {
+  var s = t.sessions[0]
+  var stuck = /bloque/i.test(t.status || '')
+  var color = fresh ? 'var(--c-waiting)' : s ? 'var(--c-working)' : stuck ? 'var(--c-blocked)' : 'var(--c-idle)'
+  var chips = [chip(t.status || 'sin estado', stuck ? 'var(--c-blocked)' : JIRA_CATEGORY[t.category] || 'var(--muted)', 'Estado en Jira')]
+  if (fresh) chips.push(chip('nuevo', 'var(--c-waiting)'))
+  if (s) chips.push('<button class="pchip c" style="--c:var(--c-working)" data-tsession="' + esc(t.key) + '" title="Ir a su sesión en Orca"><span class="pdot"></span>trabajando · ' + esc(s.name) + '</button>')
+  chips.push(harnessChip(t.harness))
+  if (t.pushed.length) chips.push(chip('rama pusheada', 'var(--add)', 'En origin (último fetch): ' + t.pushed.join(', ')))
+  if (t.blocker) chips.push(chip('⛔ decisión de negocio', 'var(--c-blocked)', t.blocker))
+  if (!s && PANEL) chips.push('<button class="pchip" data-tstart="' + esc(t.key) + '" title="Workspace nuevo en Orca, con la rama del ticket">▶ Arrancar</button>')
+  chips.push('<button class="pchip" data-tjira="' + esc(t.key) + '" title="Abrir en Jira">Jira ↗</button>')
+  return '<div class="item ticket' + (fresh ? ' unread' : '') + '" style="--c:' + color + '" data-ticket="' + esc(t.key) + '" title="' + esc(t.title) + '">' +
+    '<div class="top"><span class="tag">' + esc(t.key) + '</span><span class="ititle trunc">' + (t.blocker ? '⛔ ' : '') + esc(t.title) + '</span><span class="ago">' + ago(t.updated) + '</span></div>' +
+    (t.brief ? '<div class="msg">' + esc(t.brief) + '</div>' : '') + '<div class="pchips">' + chips.join('') + '</div></div>'
+}
+function ticketGroup(title, rows, fresh) {
+  return rows.length ? heading(title, rows.length) + rows.map(function (t) { return ticketItem(t, fresh) }).join('') : ''
+}
+function jiraView() {
+  if (!jira) return jiraError ? '<div class="none">' + esc(jiraError) + '</div>' : '<p class="hint">Cargando…</p>'
+  if (!jira.enabled) return heading('Jira', 0) + '<div class="none">Sin configurar: agregá «jira» a policy.json (mirá policy.example.json).</div>'
+  var out = ''
+  if (jira.error) out += '<div class="alert" style="--c:var(--c-waiting)">No pude consultar Jira: ' + esc(jira.error) + (jira.fetchedAt ? ' Muestro lo de hace ' + short(jira.fetchedAt) + '.' : '') + '</div>'
+  var fresh = jira.issues.filter(function (t) { return isNewTicket(t, jiraSeenShown) })
+  var rest = jira.issues.filter(function (t) { return !isNewTicket(t, jiraSeenShown) })
+  var working = rest.filter(function (t) { return t.sessions.length })
+  var others = rest.filter(function (t) { return !t.sessions.length })
+  if (!jira.issues.length) out += heading('Mis tickets · ' + jira.project, 0) + '<div class="none">No tenés tickets abiertos en ' + esc(jira.project) + '.</div>'
+  out += ticketGroup('Nuevos', fresh, true) + ticketGroup('Trabajando', working, false) + ticketGroup('Asignados · ' + jira.project, others, false)
+  return out + '<p class="hint">Clic en un ticket → su sesión en Orca, o Jira si no tiene. Jira se consulta cada 5 min' + (jira.fetchedAt ? ' · última hace ' + short(jira.fetchedAt) : '') + '.</p>'
+}
+function ticketOf(key) { return jira && jira.issues ? jira.issues.filter(function (t) { return t.key === key })[0] : null }
+function openExternal(url) {
+  if (!/^https:\/\//.test(url || '')) return
+  if (PANEL) { if (orca.shell) orca.shell.openExternal(url) } else window.open(url, '_blank', 'noopener')
+}
+function openTicket(key, toJira) {
+  var t = ticketOf(key)
+  if (!t) return
+  var s = t.sessions[0]
+  if (s && !toJira) openInOrca(s.worktreeId, s.terminalId, s.path)
+  else openExternal(t.url)
+}
+function loadJira() {
+  return api('/api/jira').then(function (j) { jira = j; jiraError = '' }, function (e) { jiraError = e.message }).then(function () {
+    if (!PANEL) return
+    return orca.storage.get(JIRA_KNOWN_KEY).then(function (v) { jiraKnown = v && typeof v === 'object' ? v : {} })
+  }).catch(function (e) { console.error('[command-deck] no pude leer Jira', e) }).then(renderBoard)
+}
+// Arrancar: elegís el repo (agrupados como en Orca), ves qué se va a crear y confirmás. Lo crea el worker.
+function startPicker(key) {
+  var t = ticketOf(key)
+  if (!t) return
+  orca.plugin.request('projects').then(function (paths) {
+    var roots = data.filter(function (r) { return !r.worktreeOf && paths.indexOf(r.key) >= 0 })
+    var box = document.getElementById('box')
+    box.textContent = ''
+    var input = el('input')
+    input.placeholder = 'Repo donde arrancar ' + key
+    box.appendChild(input)
+    var options = el('div', 'list')
+    box.appendChild(options)
+    function paint() {
+      var term = input.value.trim().toLowerCase()
+      options.textContent = ''
+      var last = null
+      roots.forEach(function (r) {
+        if (term && (r.name + ' ' + r.group).toLowerCase().indexOf(term) < 0) return
+        if (r.group !== last) { options.appendChild(el('div', 'opt-h', r.group || 'Sin grupo')); last = r.group }
+        var o = el('div', 'opt')
+        o.appendChild(el('span', '', r.name))
+        o.appendChild(el('span', 'meta', 'base ' + r.base))
+        o.onclick = function () { closeModal(); confirmStart(t, r) }
+        options.appendChild(o)
+      })
+      if (!options.childNodes.length) options.appendChild(el('div', 'opt-h', 'Ningún repo coincide.'))
+    }
+    input.oninput = paint
+    paint()
+    document.getElementById('modal').style.display = 'flex'
+    input.focus()
+  }).catch(function (e) { toast(e.message || 'No pude leer los proyectos de Orca.') })
+}
+function confirmStart(t, r) {
+  api('/api/jira-start?key=' + encodeURIComponent(t.key) + '&repo=' + encodeURIComponent(r.key)).then(function (plan) {
+    var lines = [
+      { text: 'Repo: ' + plan.repo + (plan.group ? ' (' + plan.group + ')' : '') },
+      { text: 'Rama nueva: ' + plan.branch },
+      { text: 'Sale de: ' + plan.baseRef + ', la base del repo, como quedó en el último fetch.' }
+    ]
+    if (plan.existing.length) lines.push({ warn: true, text: 'Ya hay ramas de este ticket en el repo: ' + plan.existing.join(', ') })
+    lines.push({ text: 'Abre un workspace nuevo en Orca y arranca ' + plan.agent + ' con: «' + plan.prompt + '»' })
+    dialog('Arrancar ' + t.key, lines, [], [
+      { label: 'Cancelar', safe: true },
+      { label: 'Crear workspace', kind: 'primary', run: function () { runStart(t.key, r.key) } }
+    ])
+  }).catch(function (e) { toast(e.message) })
+}
+function runStart(key, repo) {
+  toast('Creando el workspace de ' + key + '…', true)
+  orca.plugin.request('jiraStart', { key: key, repo: repo }, { timeoutMs: JIRA_REQUEST_MS }).then(function (r) {
+    toast(r.branch === r.expected ? 'Workspace creado en ' + r.branch : 'Workspace creado, pero Orca le puso a la rama ' + r.branch + ' (esperaba ' + r.expected + ')', r.branch === r.expected)
+    loadJira()
+  }).catch(function (e) { toast(e.message || 'Orca no pudo crear el workspace.') })
 }
 function markNoticesRead() {
   var last = notices.length ? notices[0].at : 0
@@ -1039,7 +1177,8 @@ function renderTabs(v) {
     return '<button role="tab" data-view="' + id + '" aria-selected="' + (view === id) + '">' + label + (n !== undefined ? '<span class="n">' + n + '</span>' : '') + '</button>'
   }
   document.getElementById('tabs').innerHTML = t('resumen', 'Resumen') + t('sesiones', 'Sesiones', v ? v.kpis.fresh : undefined) +
-    (PANEL ? t('avisos', 'Avisos', unreadNotices().length || undefined) : '') + t('git', 'Git', dirty || undefined)
+    (PANEL ? t('avisos', 'Avisos', unreadNotices().length || undefined) : '') +
+    (jira && jira.enabled ? t('jira', 'Jira', jiraUnseen() || undefined) : '') + t('git', 'Git', dirty || undefined)
 }
 function renderAlerts() {
   var out = []
@@ -1058,6 +1197,12 @@ function renderBoard() {
   wallRows = {}
   if (view === 'avisos') {
     boardInner.innerHTML = noticesView()
+    return
+  }
+  if (view === 'jira') {
+    var top = board.scrollTop
+    boardInner.innerHTML = jiraView()
+    board.scrollTop = top
     return
   }
   if (!wall) {
@@ -1097,6 +1242,7 @@ function drawWires() {
 new ResizeObserver(drawWires).observe(board)
 
 function setView(next) {
+  if (next === 'jira' && view !== 'jira') markJiraSeen()
   view = next
   store('view', next)
   if (next === 'avisos') markNoticesRead()
@@ -1120,8 +1266,11 @@ function openSession(a) {
   openInOrca(a.worktreeId, a.terminalId, a.path)
 }
 function onBoardClick(e) {
-  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice]')
+  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice],[data-tjira],[data-tstart],[data-tsession],[data-ticket]')
   if (!t) return
+  if (t.dataset.tjira) return openTicket(t.dataset.tjira, true)
+  if (t.dataset.tstart) return startPicker(t.dataset.tstart)
+  if (t.dataset.tsession || t.dataset.ticket) return openTicket(t.dataset.tsession || t.dataset.ticket, false)
   if (t.dataset.filter) { filter = t.dataset.filter; find.value = ''; setView('git') }
   else if (t.dataset.view) setView(t.dataset.view)
   else if (t.dataset.row) { if (wallRows[t.dataset.row]) openSession(wallRows[t.dataset.row]) }
@@ -1189,7 +1338,8 @@ if (!PANEL) {
   }
 }
 renderBoard()
-restorePanelState().then(loadWall)
+restorePanelState().then(loadWall).then(loadJira)
+setInterval(function () { if (!document.hidden) loadJira() }, JIRA_POLL_MS)
 setInterval(function () { if (!document.hidden) loadWall() }, PANEL ? PANEL_POLL_MS : POLL_MS)
 if (PANEL) {
   var eventTimer

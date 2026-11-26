@@ -149,3 +149,16 @@ export function addNotice(list, notice, max = NOTICES_MAX) {
   const rest = (Array.isArray(list) ? list : []).filter((n) => n.id !== notice.id)
   return [notice, ...rest].slice(0, max)
 }
+
+// El ítem de la barra de estado: cuántos avisos no leíste y el último. Sin avisos nuevos, se esconde.
+export function statusBarOf(list, read = 0) {
+  const unread = (Array.isArray(list) ? list : []).filter((n) => n.at > read)
+  if (!unread.length) return { visible: false }
+  const n = unread.length
+  return {
+    visible: true,
+    text: n === 1 ? '1 aviso' : `${n} avisos`,
+    tone: unread.some((x) => x.state === 'blocked' || x.state === 'waiting') ? 'warning' : 'accent',
+    tooltip: `${unread[0].title} · clic para ir`.slice(0, 256)
+  }
+}

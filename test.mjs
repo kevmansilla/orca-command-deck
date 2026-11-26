@@ -45,6 +45,12 @@ writeFileSync(join(tickets, '_template/deploy.md'), '# Deploy\n**No.**\n')
 writeFileSync(join(tickets, 'ABC-7-prueba/US.md'), '# ABC-7\n\n- **Estado:** en curso\n')
 writeFileSync(join(tickets, 'ABC-7-prueba/test.md'), '# Test\n1. (paso)\n')
 writeFileSync(join(tickets, 'ABC-7-prueba/deploy.md'), '# Deploy\n**No.**\n- `make rebuild`\n')
+mkdirSync(join(tickets, 'ABC-8-mails'))
+writeFileSync(join(tickets, 'ABC-8-mails/US.md'), '# ABC-8\n\n- **Estado:** listo-para-deploy\n')
+writeFileSync(join(tickets, 'ABC-8-mails/roadmap.md'), '# Roadmap\n\n- ⛔ **Decisión de negocio:** qué texto ve el cliente — decide alguien\n')
+// ABC-7 dice «en curso» en US.md, que no es un estado fijo: vale su fila del índice.
+writeFileSync(join(tickets, 'INDEX.md'), '| ID | Carpeta | Estado |\n|---|---|---|\n| ABC-7 | [x](ABC-7-prueba/US.md) | `en-progreso` |\n')
+writeFileSync(join(tmp, 'jira.env'), 'JIRA_EMAIL="persona@example.com"\nexport JIRA_TOKEN=token-de-prueba\n')
 const scanner = join(tmp, 'scanner.sh')
 writeFileSync(scanner, `#!/bin/sh
 if grep -q FALLA "$@"; then exit 3; fi
@@ -68,7 +74,8 @@ writeFileSync(join(tmp, 'policy.json'), JSON.stringify({
     { label: 'Otro', run: 'git otro', under: join(tmp, 'libre') },
     { label: 'A {base}', run: 'git a', when: 'feature' }
   ],
-  worktrees: { create: 'git wt {repo} {branch}', remove: 'git wt -d {repo} {branch}' }
+  worktrees: { create: 'git wt {repo} {branch}', remove: 'git wt -d {repo} {branch}' },
+  jira: { site: 'https://jira.example.test/', project: 'ABC', credentials: join(tmp, 'jira.env'), tickets, startPrompt: 'Arrancamos {key}: {title} ({url})' }
 }))
 process.env.MRG_REPOS_FILE = join(tmp, 'repos.json')
 process.env.MRG_POLICY_FILE = join(tmp, 'policy.json')
@@ -88,6 +95,8 @@ const orcaFalso = {
       { state: 'waiting', stateStartedAt: 300, conversationName: 'chat', orcaSessionId: 's-chat' }
     ]
   }, {
+    worktreeId: 'r1::/p/abc7', repo: 'app', displayName: 'app', path: '/p/abc7', branch: 'refs/heads/ABC-7-prueba', workspaceKind: 'git', lastActivityAt: 4, agents: []
+  }, {
     worktreeId: 'b1::/bots/k', path: '/bots/k', repo: 'Bots', displayName: 'Asistente', bot: 'Asistente', status: 'inactive', workspaceKind: 'folder-workspace', lastActivityAt: 9, agents: []
   }],
   sessions: async () => new Set(['s-chat']),
@@ -95,7 +104,18 @@ const orcaFalso = {
   focus: async (t) => { if (t === 'term_b2') throw new Error('stale'); enfocadas.push(t) },
   activate: async (id) => activados.push(id)
 }
-const { port, token, close } = await startServer({ terminal: async (t) => opened.push(t), orca: orcaFalso })
+// Un Jira inventado: cuenta las consultas y guarda lo que se le pidió.
+const adf = (...content) => ({ type: 'doc', version: 1, content })
+const parrafo = (text, bold = false) => ({ type: 'paragraph', content: [{ type: 'text', text, ...(bold ? { marks: [{ type: 'strong' }] } : {}) }] })
+const jiraPedidos = []
+const jiraFalso = async (url, init) => {
+  jiraPedidos.push({ url, auth: init.headers.Authorization })
+  return new Response(JSON.stringify({ issues: [
+    { key: 'ABC-8', fields: { summary: 'Revisar el envío de mails', updated: '2026-01-02T10:00:00.000-0300', status: { name: 'To Do', statusCategory: { key: 'new' } }, description: adf({ type: 'heading', content: [{ type: 'text', text: 'Contexto' }] }, parrafo('Ejemplo', true), parrafo('Hay que mandar los mails desde un solo lugar.'), { type: 'codeBlock', content: [{ type: 'text', text: 'select 1' }] }) } },
+    { key: 'ABC-7', fields: { summary: 'Prueba', updated: '2026-01-01T10:00:00.000-0300', status: { name: 'En curso', statusCategory: { key: 'indeterminate' } }, description: null } }
+  ] }), { status: 200 })
+}
+const { port, token, close } = await startServer({ terminal: async (t) => opened.push(t), orca: orcaFalso, jiraFetch: jiraFalso })
 const base = `http://127.0.0.1:${port}`
 let failures = 0
 
@@ -276,7 +296,7 @@ try {
   check('pit wall lista los bots aunque estén dormidos', snap.bots.some((b) => b.name === 'Asistente' && b.status === 'inactive' && b.worktreeId))
   check('pit wall suma los bots que Orca no tiene abiertos, sin repetir', snap.bots.length === 2 && snap.bots.some((b) => b.name === 'Avisos' && b.status === 'closed' && b.worktreeId === null))
   check('pit wall pasa la carpeta de cada sesión para abrirla', snap.waiting.every((a) => a.path))
-  check('pit wall cuenta los workspaces', snap.worktrees === 2)
+  check('pit wall cuenta los workspaces', snap.worktrees === 3)
   check('flatten recorta los mensajes largos', flatten('x'.repeat(300)).length === 140)
   const { shouldNotify } = await import('./main.mjs')
   const estados = new Map()
@@ -298,6 +318,10 @@ try {
   check('no avisa del estado viejo de una sesión que recién se abre', chatNotices(new Map(), foto([fila({ state: 'done', since: 50 })]), 200, 60).notices.length === 0)
   const bandeja = addNotice(addNotice(addNotice([], { id: 'a' }), { id: 'b' }), { id: 'a' }, 2)
   check('la bandeja pone lo nuevo primero, sin repetir y con tope', bandeja.map((n) => n.id).join() === 'a,b')
+  const { statusBarOf } = await import('./pitwall.mjs')
+  check('la barra de estado se esconde sin avisos nuevos', statusBarOf([{ at: 5, title: 'x' }], 5).visible === false)
+  const barra = statusBarOf([{ at: 9, title: 'Kevinito terminó', state: 'done' }, { at: 8, title: 'y', state: 'waiting' }, { at: 2 }], 5)
+  check('la barra de estado cuenta los no leídos y muestra el último', barra.text === '2 avisos' && barra.tone === 'warning' && barra.tooltip.startsWith('Kevinito terminó'))
   const [codigoWall, wall] = await call('/api/pitwall')
   check('/api/pitwall devuelve las sesiones', codigoWall === 200 && wall.working.length === 1 && wall.error === null)
   check('/api/open enfoca la terminal', (await call('/api/open', { worktreeId: 'r1::/p/app', terminalId: 'term_a1' }))[0] === 200 && enfocadas.join() === 'term_a1')
@@ -305,6 +329,50 @@ try {
   check('/api/open no enfoca una terminal de otro workspace', (await call('/api/open', { worktreeId: 'r1::/p/app', terminalId: 'term_zz' }))[0] === 200 && enfocadas.length === 1 && activados.length === 2)
   check('sirve el código de la página sin token', (await fetch(base + '/app.js')).status === 200 && (await fetch(base + '/app.css')).status === 200)
   check('/api/open rechaza un workspace desconocido', (await call('/api/open', { worktreeId: 'otro' }))[0] === 400)
+
+  // Jira
+  const { adfLines, blockerIn, branchFor, briefOf, jiraConfig, jiraNews, parseEnv, sessionsOf, slugOf } = await import('./jira.mjs')
+  check('jira: sin https o sin proyecto válido no hay configuración', jiraConfig({ site: 'http://x.test', project: 'ABC', credentials: 'c' }) === null && jiraConfig({ site: 'https://x.test', project: 'abc', credentials: 'c' }) === null)
+  check('jira: lee el .env con comillas y export', parseEnv('A="1"\nexport B=\'2\'\n# nada').A === '1' && parseEnv('export B=\'2\'').B === '2')
+  check('jira: la descripción breve saltea títulos, rótulos en negrita y código', briefOf(adf({ type: 'heading', content: [{ type: 'text', text: 'Título' }] }, parrafo('Ejemplo', true), parrafo('Hacer esto.'), { type: 'codeBlock', content: [{ type: 'text', text: 'x' }] }, parrafo('Y aquello.'))) === 'Hacer esto. Y aquello.')
+  check('jira: la descripción breve se recorta', briefOf(adf(parrafo('x'.repeat(500)))).length === 220 && briefOf(null) === null)
+  check('jira: el texto de listas y menciones también cuenta', adfLines(adf({ type: 'bulletList', content: [{ type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'mention', attrs: { text: '@Ana' } }, { type: 'text', text: ' revisa' }] }] }] })).map((l) => l.text).join() === '@Ana revisa')
+  check('jira: la rama lleva la clave y el título sin tildes', branchFor('ABC-8', 'Revisar el envío de mails ¡ya!') === 'ABC-8-revisar-el-envio-de-mails-ya' && slugOf('a'.repeat(60)).length === 40)
+  const conRamas = [{ worktreeId: 'w1', branch: 'refs/heads/ABC-12-algo', agents: [{ address: 'term_1', state: 'working' }] }, { worktreeId: 'w2', branch: 'ABC-123-otro', agents: [] }, { worktreeId: 'w3', branch: 'ABC-12-bot', bot: 'x', agents: [] }]
+  const sesiones12 = sessionsOf('ABC-12', conRamas)
+  check('jira: el workspace se reconoce por la rama, sin confundir ABC-12 con ABC-123 ni contar bots', sesiones12.length === 1 && sesiones12[0].terminalId === 'term_1' && sesiones12[0].agentWorking)
+  check('jira: la traba abierta se lee de la línea ⛔ y la resuelta no cuenta', blockerIn('- ⛔ **Decisión de negocio:** el texto') === 'el texto' && blockerIn('✅ Decisión de negocio resuelta: listo') === null)
+  const n0 = jiraNews(null, ['ABC-1'], 10)
+  check('jira: la primera vuelta solo toma nota', n0.fresh.length === 0 && n0.known['ABC-1'] === 0)
+  const n1 = jiraNews(n0.known, ['ABC-1', 'ABC-2'], 20)
+  check('jira: avisa el ticket que te asignaron, una vez', n1.fresh.join() === 'ABC-2' && n1.known['ABC-2'] === 20 && jiraNews(n1.known, ['ABC-1', 'ABC-2'], 30).fresh.length === 0)
+  const n2 = jiraNews(jiraNews(n1.known, ['ABC-1'], 40).known, ['ABC-1', 'ABC-2'], 50)
+  check('jira: si te lo sacan y te lo vuelven a asignar, avisa de nuevo', n2.fresh.join() === 'ABC-2' && n2.known['ABC-2'] === 50)
+  sh(repo, 'git', 'branch', '-q', 'ABC-8-algo', 'origin/master')
+  sh(repo, 'git', 'push', '-q', 'origin', 'ABC-8-algo')
+  sh(repo, 'git', 'branch', '-q', '-D', 'ABC-8-algo')
+  const [codigoJira, mios] = await call('/api/jira')
+  const t8 = mios.issues?.find((t) => t.key === 'ABC-8')
+  const t7 = mios.issues?.find((t) => t.key === 'ABC-7')
+  check('/api/jira devuelve tus tickets, con workspace primero', codigoJira === 200 && mios.enabled && mios.error === null && mios.issues.map((t) => t.key).join() === 'ABC-7,ABC-8')
+  check('/api/jira arma la descripción breve y el link', t8.brief === 'Hay que mandar los mails desde un solo lugar.' && t8.url === 'https://jira.example.test/browse/ABC-8')
+  check('/api/jira marca el ticket que tiene workspace en Orca', t7.sessions.length === 1 && t7.sessions[0].worktreeId === 'r1::/p/abc7' && t8.sessions.length === 0)
+  check('/api/jira suma el estado del harness y la traba', t8.harness.state === 'listo-para-deploy' && !t8.harness.deployed && t8.blocker?.startsWith('qué texto ve el cliente') && t7.harness.state === 'en-progreso' && t7.blocker === null)
+  // ABC-7 ya está en el remoto desde las pruebas de tickets, y los otros clones lo trajeron al clonar.
+  check('/api/jira marca la rama pusheada, según lo que cada repo trajo del remoto', t8.pushed.join() === 'app' && t7.pushed.includes('sin-regla'))
+  const pedido = jiraPedidos[0]
+  check('jira: consulta tus tickets abiertos del proyecto, con el token solo en el encabezado', jiraPedidos.length === 1 && /project\+%3D\+ABC\+AND\+assignee\+%3D\+currentUser/.test(pedido.url) && !pedido.url.includes('token-de-prueba') && pedido.auth === `Basic ${Buffer.from('persona@example.com:token-de-prueba').toString('base64')}`)
+  await call('/api/jira')
+  check('jira: la segunda consulta sale de la caché', jiraPedidos.length === 1)
+  const [codigoPlan, plan] = await call('/api/jira-start?key=ABC-8&repo=app')
+  check('/api/jira-start arma la rama desde origin/<base> y el primer mensaje', codigoPlan === 200 && plan.branch === 'ABC-8-revisar-el-envio-de-mails' && plan.baseRef === 'origin/master' && plan.existing.join() === 'origin/ABC-8-algo' && plan.prompt === 'Arrancamos ABC-8: Revisar el envío de mails (https://jira.example.test/browse/ABC-8)' && plan.agent === 'claude')
+  check('/api/jira-start no escribe git', !sh(repo, 'git', 'branch', '--list', 'ABC-8-*').trim())
+  check('/api/jira-start rechaza un ticket que no es tuyo', (await call('/api/jira-start?key=ABC-99&repo=app'))[0] === 400 && (await call('/api/jira-start?key=x;rm&repo=app'))[0] === 400)
+  const caido = await startServer({ orca: orcaFalso, jiraFetch: async () => new Response('{}', { status: 401 }) })
+  const rCaido = await fetch(`http://127.0.0.1:${caido.port}/api/jira`, { headers: { 'X-Token': caido.token } })
+  const jCaido = await rCaido.json()
+  caido.close()
+  check('jira: si Jira rechaza, el panel recibe el error sin el token y sin romperse', rCaido.status === 200 && jCaido.enabled && jCaido.issues.length === 0 && /401/.test(jCaido.error) && !JSON.stringify(jCaido).includes('token-de-prueba'))
 } finally {
   close()
 }

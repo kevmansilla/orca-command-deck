@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "command-deck",
   "name": "Command Deck",
-  "version": "0.4.0",
-  "description": "Tus agentes, bots y repos en un solo panel: quién te espera, quién trabaja, y el Source Control de todos los repos de Orca.",
+  "version": "0.5.0",
+  "description": "Tus agentes, bots, repos y tickets de Jira en un solo panel: quién te espera, quién trabaja, el Source Control de todos los repos de Orca y tus tickets.",
   "engines": {
     "orca": ">=1.4.259"
   },
@@ -24,6 +24,21 @@
       {
         "on": "agent.status.changed"
       }
+    ],
+    "commands": [
+      {
+        "id": "avisos.abrir",
+        "title": "Command Deck: ir al último aviso"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "avisos",
+        "icon": "bell",
+        "text": "",
+        "tooltip": "Command Deck: sin avisos nuevos",
+        "command": "avisos.abrir"
+      }
     ]
   },
   "capabilities": [
@@ -41,6 +56,12 @@
     },
     {
       "kind": "agent:read"
+    },
+    {
+      "kind": "workspace:create"
+    },
+    {
+      "kind": "agent:launch"
     }
   ]
 }

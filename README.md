@@ -8,6 +8,7 @@ Arriba tiene además un tablero al estilo de [Pit Wall](https://github.com/Juanp
 | --- | --- |
 | **Resumen** | Contadores de sesiones, bots y repos; el organigrama vos → proyectos → sesiones coloreado por estado; **Qué hacer ahora** y tus bots |
 | **Sesiones** | Las que te esperan, las que trabajan, los bots y, plegadas, las terminadas que ya abriste |
+| **Jira** | Tus tickets abiertos, si configurás `jira` (ver abajo) |
 | **Git** | El Source Control |
 
 Cuando una sesión pide permiso o hace una pregunta, o cuando un bot termina, avisa con una notificación de escritorio, aunque el panel esté cerrado. Los chats y bots sin terminal se revisan cada 15 s. La pestaña «Avisos» guarda los últimos 30, con contador de no leídos y clic para ir a la sesión. La campana «avisos» del panel apaga las notificaciones de escritorio; la pestaña los guarda igual. El panel se refresca solo con cada cambio de estado de un agente.
@@ -24,7 +25,7 @@ Necesitás Orca 1.4.259 o más nuevo.
 orca plugin install kevmansilla/orca-command-deck
 ```
 
-Orca muestra lo que pide el plugin y la línea para volver a correrlo con `--approve <fingerprint>`. Pide correr su propio proceso (ejecuta git con tus permisos), mostrar notificaciones, guardar en su carpeta las sesiones que ya viste, leer tus workspaces y sus agentes (para el tablero y los avisos) y abrir workspaces o enfocar terminales (cuando hacés clic).
+Orca muestra lo que pide el plugin y la línea para volver a correrlo con `--approve <fingerprint>`. Pide correr su propio proceso (ejecuta git con tus permisos), mostrar notificaciones, guardar en su carpeta las sesiones que ya viste, leer tus workspaces y sus agentes (para el tablero y los avisos), abrir workspaces o enfocar terminales (cuando hacés clic) y crear un workspace con un agente (solo cuando arrancás un ticket de Jira y lo confirmás).
 
 Después tocá su ícono (unas capas) en la barra lateral, o abrilo con:
 
@@ -97,6 +98,27 @@ Con `"pullRequests": false` se oculta el botón Abrir PR.
 ## Tickets
 
 `"tickets": [{ "under": "~/trabajo", "dir": "~/trabajo/tickets" }]` une cada rama con la carpeta de su ticket. De `ABC-123-algo` busca `ABC-123-*` en `dir` y en `dir/_archivo`, y muestra el estado de `US.md` (`- **Estado:** en curso`). También avisa si `test.md` no tiene nada propio o si `deploy.md` tiene pasos sin ejecutar. Lo que coincide con `_template/` no cuenta.
+
+## Jira
+
+Con `"jira"` en `policy.json` aparece la pestaña **Jira**: los tickets del proyecto asignados a vos que no están terminados, con su clave, título, estado, una descripción breve (las primeras líneas útiles, en texto plano) y el link a Jira.
+
+```json
+"jira": {
+  "site": "https://mi-empresa.atlassian.net",
+  "project": "ABC",
+  "credentials": "~/.config/jira/credenciales.env",
+  "tickets": "~/trabajo/tickets",
+  "startPrompt": "Arrancamos {key}: {title}. Leé el ticket en Jira: {url}"
+}
+```
+
+- `credentials` es un archivo con `JIRA_EMAIL` y `JIRA_TOKEN` (un token de API de Atlassian). Lo lee solo el servidor local: el token no llega al panel ni a los logs. La consulta es de solo lectura y sale como mucho cada 5 minutos; si falla, el panel muestra lo último que llegó, con el aviso.
+- Un ticket cuya rama (`ABC-12-algo`) tiene un workspace en Orca dice «trabajando», y el clic lleva a esa sesión.
+- Cuando te asignan uno nuevo queda marcado «nuevo» hasta que mirás la pestaña, y llega a la pestaña Avisos (y al escritorio, si la campana está prendida), una vez por asignación.
+- «rama pusheada»: alguno de tus repos tiene `origin/ABC-12-*`, según su último fetch (no hace fetch).
+- `tickets` (opcional) es una carpeta con una subcarpeta por ticket (`ABC-12-algo/`). De ahí sale el estado del desarrollo (`- **Estado:**` de `US.md`, o su fila en `INDEX.md`): «listo para deploy», «deployado» (también si `deploy.md` dice `ejecutado`) o el estado que tenga. Una línea `⛔ Decisión de negocio: …` en `roadmap.md` o `US.md` marca el ticket con ⛔.
+- **Arrancar**, en un ticket sin workspace: elegís el repo, ves la rama nueva (`ABC-12-<título>`), de qué base sale (`origin/<base>`, con las mismas reglas de protección de arriba) y el primer mensaje, y al confirmar Orca crea el workspace y arranca el agente (`agent`, por defecto `claude`). No commitea ni pushea nada.
 
 ## Secretos
 

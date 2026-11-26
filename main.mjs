@@ -3,7 +3,8 @@
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import { addNotice, chatNotices, NEEDS_YOU } from './pitwall.mjs'
+import { jiraNews } from './jira.mjs'
+import { addNotice, chatNotices, NEEDS_YOU, statusBarOf } from './pitwall.mjs'
 import { readState, serverStamp } from './state.mjs'
 
 const DAEMON = fileURLToPath(new URL('./daemon.mjs', import.meta.url))
@@ -13,8 +14,14 @@ const TERMINAL_RE = /^term_[\w-]+$/
 // Igual que en app.js: la campana del panel guarda acá si se avisa, y la pestaña Avisos lee la bandeja.
 const NOTIFY_KEY = 'notify'
 const NOTICES_KEY = 'avisos'
+const NOTICES_READ_KEY = 'avisosLeidos'
+const STATUS_ITEM = 'avisos'
 // Cada cuánto se miran los chats sin terminal (bots y chats nativos), que no llegan por el evento.
 const CHAT_POLL_MS = 15000
+// Los tickets de Jira: el servidor consulta Jira como mucho cada 5 min, esto solo mira su caché.
+const JIRA_POLL_MS = 60000
+// Igual que en app.js: { clave: cuándo apareció } de tus tickets, para avisar y marcar los nuevos.
+const JIRA_KNOWN_KEY = 'jiraConocidos'
 
 async function alive(state) {
   if (!state) return false
@@ -122,10 +129,41 @@ function deliver(orca, notice) {
     await orca.storage.set(NOTICES_KEY, addNotice(list, notice))
   }).catch((e) => orca.log(`no pude guardar el aviso: ${e.message}`))
   return saving.then(async () => {
+    await paintStatusBar(orca)
     if ((await orca.storage.get(NOTIFY_KEY)) === false) return
     const body = [notice.where, notice.body].filter(Boolean).join(' · ')
     await orca.host.call('notifications.show', { title: notice.title, body: body || undefined })
   })
+}
+
+// Lo que no leíste, en la barra de estado de Orca. Tenerla hace además que Orca no apague el worker por inactividad.
+let painted = ''
+async function paintStatusBar(orca) {
+  try {
+    const [list, read] = await Promise.all([orca.storage.get(NOTICES_KEY), orca.storage.get(NOTICES_READ_KEY)])
+    const item = statusBarOf(list, typeof read === 'number' ? read : 0)
+    const next = JSON.stringify(item)
+    if (next === painted) return
+    await orca.host.call('statusBar.update', { id: STATUS_ITEM, ...item })
+    painted = next
+  } catch (e) {
+    orca.log(`no pude actualizar la barra de estado: ${e.message}`)
+  }
+}
+
+// El clic en la barra de estado: lleva a la sesión del último aviso y los da por leídos.
+async function openLatestNotice(orca) {
+  const list = await orca.storage.get(NOTICES_KEY)
+  const latest = Array.isArray(list) ? list[0] : null
+  if (!latest) return
+  await orca.storage.set(NOTICES_READ_KEY, latest.at)
+  await paintStatusBar(orca)
+  if (!latest.terminalId && !latest.path) return // un ticket nuevo de Jira no tiene sesión: se ve en el panel
+  try {
+    await openInOrca(orca, { terminalId: latest.terminalId, path: latest.path })
+  } catch (e) {
+    orca.log(`no pude abrir el aviso: ${e.message}`) // la sesión ya no está: el aviso queda leído igual
+  }
 }
 
 async function noticeOfEvent(orca, event) {
@@ -154,6 +192,7 @@ function watchChats(orca) {
       const result = chatNotices(seen, data, Date.now(), since)
       seen = result.seen
       for (const notice of result.notices) await deliver(orca, notice)
+      await paintStatusBar(orca) // también refleja lo que leíste en el panel
     } catch (e) {
       orca.log(`no pude mirar los chats: ${e.message}`)
     }
@@ -162,10 +201,73 @@ function watchChats(orca) {
   setInterval(tick, CHAT_POLL_MS)
 }
 
+// Avisa una vez por cada ticket que te asignan: lo que aparece en la lista y no estaba en la vuelta anterior.
+function watchJira(orca) {
+  const tick = async () => {
+    try {
+      const { status, data } = await relay({ path: '/api/jira' })
+      // Sin Jira, o con un error (la lista puede ser vieja o estar vacía), no se compara.
+      if (status !== 200 || !data?.enabled || data.error) return
+      const known = await orca.storage.get(JIRA_KNOWN_KEY)
+      const now = Date.now()
+      const result = jiraNews(known && typeof known === 'object' && !Array.isArray(known) ? known : null, data.issues.map((t) => t.key), now)
+      await orca.storage.set(JIRA_KNOWN_KEY, result.known)
+      for (const key of result.fresh) {
+        const t = data.issues.find((x) => x.key === key)
+        await deliver(orca, { id: `jira|${key}|${now}`, at: now, state: 'jira', jira: true, bot: false, title: `Ticket nuevo: ${key}`, where: t.title, body: t.brief, path: null, terminalId: null })
+      }
+    } catch (e) {
+      orca.log(`no pude mirar Jira: ${e.message}`)
+    }
+  }
+  tick()
+  setInterval(tick, JIRA_POLL_MS)
+}
+
+const samePath = (a, b) => String(a ?? '').replace(/\/+$/, '') === String(b ?? '').replace(/\/+$/, '')
+
+// Los repos que Orca tiene como proyecto git: solo en esos se puede crear un workspace.
+async function gitProjects(orca) {
+  const { projects } = await orca.host.call('project.list')
+  return projects.filter((p) => p.kind === 'git' && !p.hidden)
+}
+
+// Arranca un ticket: un workspace nuevo de Orca en ese repo, con la rama del ticket sacada de origin/<base>, y el agente
+// con el primer mensaje. El plan lo arma el servidor (no se confía en lo que manda el panel) y no commitea ni pushea.
+async function startTicket(orca, { key, repo } = {}) {
+  if (typeof key !== 'string' || typeof repo !== 'string') throw Object.assign(new Error('Pedido inválido.'), { code: 'invalid_params' })
+  if (!orca.host.has('workspace.create')) throw new Error('Esta versión de Orca no deja crear workspaces desde un plugin.')
+  const { status, data: plan } = await relay({ path: `/api/jira-start?key=${encodeURIComponent(key)}&repo=${encodeURIComponent(repo)}` })
+  if (status !== 200) throw Object.assign(new Error(plan?.error ?? 'No pude preparar el ticket.'), { code: 'invalid_params' })
+  const project = (await gitProjects(orca)).find((p) => samePath(p.path, plan.path))
+  if (!project) throw Object.assign(new Error(`Orca no tiene ${plan.repo} como proyecto.`), { code: 'invalid_params' })
+  const created = await orca.host.call('workspace.create', {
+    projectId: project.id,
+    ...(project.hostId ? { hostId: project.hostId } : {}),
+    name: plan.branch,
+    baseBranch: plan.baseRef,
+    agent: plan.agent,
+    prompt: plan.prompt,
+    open: true
+  })
+  // Orca puede ajustar el nombre de la rama (prefijo, nombre repetido): se informa la que quedó.
+  let branch = plan.branch
+  try {
+    const { workspaces } = await orca.host.call('workspace.list')
+    branch = workspaces.find((w) => w.id === created.workspaceId)?.branch?.replace(/^refs\/heads\//, '') ?? branch
+  } catch (e) {
+    orca.log(`no pude leer la rama del workspace nuevo: ${e.message}`)
+  }
+  return { workspaceId: created.workspaceId, branch, expected: plan.branch }
+}
+
 export default function activate(orca) {
   const lastState = new Map()
   orca.panels.handle('api', (input) => relay(input))
   orca.panels.handle('open', (input) => openInOrca(orca, input))
+  orca.panels.handle('projects', async () => (await gitProjects(orca)).map((p) => p.path.replace(/\/+$/, '')))
+  orca.panels.handle('jiraStart', (input) => startTicket(orca, input))
+  orca.commands.register('avisos.abrir', () => openLatestNotice(orca))
   orca.events.on('agent.status.changed', async (event) => {
     if (!shouldNotify(lastState, event)) return
     try {
@@ -175,4 +277,5 @@ export default function activate(orca) {
     }
   })
   watchChats(orca)
+  watchJira(orca)
 }
