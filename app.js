@@ -76,6 +76,15 @@ function svg(name, size) {
   wrap.innerHTML = '<svg width="' + s + '" height="' + s + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[name] + '</svg>'
   return wrap.firstChild
 }
+function readJiraHidden() {
+  if (PANEL) return null // en el panel llega con restorePanelState
+  try {
+    var v = JSON.parse(localStorage.getItem(JIRA_HIDDEN_KEY))
+    return Array.isArray(v) ? v : null
+  } catch (e) {
+    return null // sin almacenamiento, vale el filtro por defecto
+  }
+}
 function readClosed() {
   try {
     return JSON.parse(localStorage.getItem('closedSpaces')) || {}
@@ -779,6 +788,8 @@ var JIRA_POLL_MS = 60000
 var JIRA_KNOWN_KEY = 'jiraConocidos'
 var JIRA_SEEN_KEY = 'jiraVisto'
 var JIRA_FOLDED_KEY = 'jiraPlegadas'
+// Los estados que elegiste ocultar en la pestaña Jira; sin guardar (null), los de por defecto del servidor.
+var JIRA_HIDDEN_KEY = 'jiraOcultos'
 // La bandeja que llena el worker (main.mjs) y hasta cuándo la leíste.
 var NOTICES_KEY = 'avisos'
 var NOTICES_READ_KEY = 'avisosLeidos'
@@ -810,8 +821,9 @@ var jiraKnown = {}
 var jiraSeen = 0
 var jiraSeenShown = 0
 var jiraFolded = {}
-// Cambios de estado en curso o fallidos, por ticket: { clave: { busy, error } }. El error queda en la tarjeta.
+// Cambios de estado en curso o fallidos, por ticket: { clave: { busy, error, warn } }. El error queda en la tarjeta.
 var jiraMoves = {}
+var jiraHidden = readJiraHidden()
 
 function readView() {
   var linked = location.hash.slice(1) // #git, #prs…: abre directo en esa pestaña
@@ -842,13 +854,14 @@ function store(key, value) {
 // Lo guardado en el panel llega después del primer dibujo.
 function restorePanelState() {
   if (!PANEL) return Promise.resolve()
-  return Promise.all(['seen', 'view', 'closedSpaces', 'zoom', JIRA_SEEN_KEY, JIRA_FOLDED_KEY].map(function (k) { return orca.storage.get(k).catch(function () { return null }) })).then(function (v) {
+  return Promise.all(['seen', 'view', 'closedSpaces', 'zoom', JIRA_SEEN_KEY, JIRA_FOLDED_KEY, JIRA_HIDDEN_KEY].map(function (k) { return orca.storage.get(k).catch(function () { return null }) })).then(function (v) {
     if (v[0] && typeof v[0] === 'object') seen = v[0]
     if (VIEWS.indexOf(v[1]) >= 0) view = v[1]
     if (v[2] && typeof v[2] === 'object') closedSpaces = v[2]
     if (typeof v[3] === 'number') setZoom(v[3], false)
     if (typeof v[4] === 'number') jiraSeen = v[4]
     if (v[5] && typeof v[5] === 'object') jiraFolded = v[5]
+    if (Array.isArray(v[6])) jiraHidden = v[6]
     if (view === 'jira') markJiraSeen()
     renderBoard()
     render()
@@ -1064,7 +1077,8 @@ function ticketItem(t, fresh, dim) {
   return '<div class="item ticket' + (fresh ? ' unread' : '') + (dim ? ' seen' : '') + '" style="--c:' + color + '" data-ticket="' + esc(t.key) + '" title="' + esc(t.title) + '">' +
     '<div class="top"><span class="tag">' + esc(t.key) + '</span><span class="ititle trunc">' + (t.blocker ? '⛔ ' : '') + esc(t.title) + '</span><span class="ago">' + ago(t.updated) + '</span></div>' +
     (t.brief ? '<div class="msg">' + esc(t.brief) + '</div>' : '') + '<div class="pchips">' + chips.join('') + '</div>' +
-    (move && move.error ? '<div class="terr">No pude cambiar el estado: ' + esc(move.error) + '</div>' : '') + '</div>'
+    (move && move.error ? '<div class="terr">No pude cambiar el estado: ' + esc(move.error) + '</div>' : '') +
+    (move && move.warn ? '<div class="terr">' + esc(move.warn) + '</div>' : '') + '</div>'
 }
 // El estado en Jira es un botón: abre el menú con las transiciones que Jira permite. Mientras se aplica, lo dice.
 function statusChip(t, stuck) {
@@ -1135,7 +1149,8 @@ function applyStatus(t, tr) {
   renderBoard()
   send('/api/jira-transition', { key: t.key, id: tr.id }).then(function (r) {
     delete jiraMoves[t.key]
-    toast(t.key + ' → ' + r.status, true)
+    if (r.trail === 'error') jiraMoves[t.key] = { warn: 'Cambió en Jira a ' + r.status + ', pero no quedó el rastro en roadmap.md (' + (r.trailError || 'error') + ').' }
+    toast(t.key + ' → ' + r.status + (r.trail === 'ok' ? ' · anotado en roadmap.md' : ''), true)
     return loadJira()
   }, function (e) {
     jiraMoves[t.key] = { error: e.message }
@@ -1173,9 +1188,35 @@ function jiraView() {
   if (!jira.enabled) return heading('Jira', 0) + '<div class="none">Sin configurar: agregá «jira» a policy.json (mirá policy.example.json).</div>'
   var out = ''
   if (jira.error) out += '<div class="alert" style="--c:var(--c-waiting)">No pude consultar Jira: ' + esc(jira.error) + (jira.fetchedAt ? ' Muestro lo de hace ' + short(jira.fetchedAt) + '.' : '') + '</div>'
-  if (!jira.issues.length) out += heading('Mis tickets · ' + jira.project, 0) + '<div class="none">No tenés tickets abiertos en ' + esc(jira.project) + '.</div>'
+  out += statusFilter()
+  if (!jira.issues.length) out += heading('Mis tickets · ' + jira.project, 0) + '<div class="none">' + (jira.hidden.length ? 'Ningún ticket tuyo en los estados elegidos.' : 'No tenés tickets en ' + esc(jira.project) + '.') + '</div>'
   out += (jira.sections || []).map(ticketSection).join('')
-  return out + '<p class="hint">Clic en un ticket → su sesión en Orca, o Jira si no tiene. Clic en el estado → cambiarlo en Jira. Jira se consulta cada 5 min' + (jira.fetchedAt ? ' · última hace ' + short(jira.fetchedAt) : '') + '.</p>'
+  var hidden = jira.hidden.length ? ' Ocultos: ' + jira.hidden.join(', ') + ' (filtro de arriba).' : ''
+  return out + '<p class="hint">Clic en un ticket → su sesión en Orca, o Jira si no tiene. Clic en el estado → cambiarlo en Jira.' + esc(hidden) + ' Jira se consulta cada 5 min' + (jira.fetchedAt ? ' · última hace ' + short(jira.fetchedAt) : '') + '.</p>'
+}
+// Arriba de la lista: un chip por estado de Jira, prendido si se ve. Lo elegido se guarda.
+function statusFilter() {
+  var hidden = jira.hidden || []
+  var isHidden = function (name) { return hidden.some(function (h) { return h.toLowerCase() === name.toLowerCase() }) }
+  var chips = (jira.statuses || []).map(function (st) {
+    var on = !isHidden(st.name)
+    return '<button class="pchip c jstatus' + (on ? '' : ' off') + '" style="--c:' + (JIRA_CATEGORY[st.category] || 'var(--muted)') + '" data-jstatus="' + esc(st.name) + '" aria-pressed="' + on + '" title="' + (on ? 'Ocultar ' : 'Mostrar ') + esc(st.name) + '">' + esc(st.name) + '</button>'
+  })
+  if (jiraHidden) chips.push('<button class="pchip" data-jreset="1" title="Volver a lo de siempre: ocultos ' + esc(jira.defaultHidden.join(', ')) + '">restablecer</button>')
+  var done = jira.done ? '<div class="jnote">Terminados: solo los actualizados en los últimos ' + jira.done.days + ' días (máx. ' + jira.done.max + ')' + (jira.done.count >= jira.done.max ? ', hay más en Jira' : '') + '.</div>' : ''
+  return '<div class="jfilter"><span class="jfilter-l">Estados</span><div class="pchips">' + chips.join('') + '</div>' + done + '</div>'
+}
+function toggleStatus(name) {
+  var hidden = (jira.hidden || []).slice()
+  var i = hidden.map(function (h) { return h.toLowerCase() }).indexOf(name.toLowerCase())
+  if (i >= 0) hidden.splice(i, 1)
+  else hidden.push(name)
+  setJiraHidden(hidden)
+}
+function setJiraHidden(hidden) {
+  jiraHidden = hidden
+  store(JIRA_HIDDEN_KEY, hidden)
+  loadJira()
 }
 function ticketOf(key) { return jira && jira.issues ? jira.issues.filter(function (t) { return t.key === key })[0] : null }
 function openExternal(url) {
@@ -1229,8 +1270,13 @@ function placeMenu(t) {
   box.appendChild(options)
   document.getElementById('modal').style.display = 'flex'
 }
+// Si cambiás el filtro mientras llega una respuesta vieja, gana la última consulta.
+var jiraRequest = 0
 function loadJira() {
-  return api('/api/jira').then(function (j) { jira = j; jiraError = '' }, function (e) { jiraError = e.message }).then(function () {
+  var mine = ++jiraRequest
+  return api('/api/jira' + (jiraHidden ? '?hide=' + encodeURIComponent(JSON.stringify(jiraHidden)) : '')).then(function (j) {
+    if (mine === jiraRequest) { jira = j; jiraError = '' }
+  }, function (e) { if (mine === jiraRequest) jiraError = e.message }).then(function () {
     if (!PANEL) return
     return orca.storage.get(JIRA_KNOWN_KEY).then(function (v) { jiraKnown = v && typeof v === 'object' ? v : {} })
   }).catch(function (e) { console.error('[command-deck] no pude leer Jira', e) }).then(renderBoard)
@@ -1404,10 +1450,12 @@ function openSession(a) {
   openInOrca(a.worktreeId, a.terminalId, a.path)
 }
 function onBoardClick(e) {
-  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice],[data-tstatus],[data-tjira],[data-tstart],[data-tsession],[data-ticket],[data-jfold]')
+  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice],[data-tstatus],[data-jstatus],[data-jreset],[data-tjira],[data-tstart],[data-tsession],[data-ticket],[data-jfold]')
   if (!t) return
   if (t.dataset.tstatus) { e.stopPropagation(); return openStatusMenu(t.dataset.tstatus) }
   if (t.dataset.jfold) return toggleFold(t.dataset.jfold)
+  if (t.dataset.jstatus) return toggleStatus(t.dataset.jstatus)
+  if (t.dataset.jreset) return setJiraHidden(null)
   if (t.dataset.tjira) return openTicket(t.dataset.tjira, true)
   if (t.dataset.tstart) return startPicker(t.dataset.tstart)
   if (t.dataset.tsession || t.dataset.ticket) return openTicket(t.dataset.tsession || t.dataset.ticket, false)

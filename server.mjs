@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { activateWorktree, createWorkspaceChat, focusTerminal, launchChat, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
-import { applyTransition, BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fetchTransitions, fillPrompt, jiraConfig, jiraRows, jiraSections, jiraTargets, pushedIn, rememberStart, sessionsOf, TRANSITION_ID_RE, visibleRows } from './jira.mjs'
+import { appendTrail, applyTransition, BLOCKER_FILES, blockerIn, branchFor, defaultHidden, DONE_DAYS, DONE_MAX, doneStatuses, fetchMyIssues, fetchProjectStatuses, fetchTransitions, fillPrompt, hiddenFrom, jiraConfig, jiraRows, jiraSections, jiraTargets, pushedIn, rememberStart, sameName, sessionsOf, trailLine, TRANSITION_ID_RE, visibleRows } from './jira.mjs'
 import { buildSnapshot, isTerminal } from './pitwall.mjs'
 import { cachePath } from './state.mjs'
 
@@ -44,6 +44,8 @@ const PITWALL_CACHE_MS = 2_000
 // Jira se consulta como mucho cada 5 minutos; las ramas del remoto (del último fetch, sin fetch nuevo), cada 2.
 const JIRA_CACHE_MS = 5 * 60_000
 const REMOTE_REFS_MS = 2 * 60_000
+// Los estados del proyecto casi no cambian.
+const JIRA_STATUSES_MS = 60 * 60_000
 // El motivo de una falla de la CLI que se muestra en el panel; el completo va al journal.
 const CLI_REASON_MAX = 300
 const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]+-\d+$/
@@ -329,6 +331,19 @@ function stateOf(dir, key, us) {
   if (inline) return inline
   const row = (readText(join(dir, 'INDEX.md')) ?? '').split('\n').find((l) => l.startsWith(`| ${key} |`))
   return row?.match(/`([a-z-]+)`/g)?.map((t) => t.slice(1, -1)).find(known) ?? null
+}
+
+// Deja en el roadmap.md del ticket (solo los abiertos, no los de _archivo) el cambio de estado hecho desde el panel.
+// 'ok' si la escribió, 'none' si no hay carpeta o roadmap.md (no se crea nada), 'error' si falló al escribir.
+function writeTrail(dir, key, from, to) {
+  const folder = dir ? ticketFolder(dir, key) : null
+  if (!folder || basename(dirname(folder)) === '_archivo') return { trail: 'none' }
+  try {
+    return { trail: appendTrail(folder, trailLine(from, to)) ? 'ok' : 'none' }
+  } catch (e) {
+    console.error(`no pude dejar el rastro de ${key} en roadmap.md: ${e.message}`)
+    return { trail: 'error', trailError: e.code ?? 'error de escritura' }
+  }
 }
 
 // Lo que el harness asienta de un ticket de Jira: su estado (US.md), si el deploy se ejecutó y la traba de negocio
@@ -744,8 +759,9 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
   let lastUse = Date.now()
   let lastFetch = 0
   let pitwall = null
-  let jira = null
-  let jiraLoading = null
+  // Tus tickets abiertos y, solo si los pedís, los terminados de los últimos días: cada uno con su caché.
+  const jiraCaches = { open: { state: null, loading: null }, done: { state: null, loading: null } }
+  let jiraStatusList = null
   let remoteRefs = null
 
   async function pitwallSnapshot() {
@@ -763,18 +779,37 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
   }
 
   // Tus tickets, de la caché si es reciente. Si Jira falla, queda lo último que respondió, con el error.
-  async function jiraIssues(cfg) {
+  async function jiraIssues(cfg, kind = 'open') {
+    const cache = jiraCaches[kind]
     const id = `${cfg.site}|${cfg.project}|${cfg.credentials}`
-    if (jira?.id === id && Date.now() - jira.at < JIRA_CACHE_MS) return jira
-    jiraLoading ??= fetchMyIssues(cfg, jiraFetch).then(
-      (issues) => { jira = { id, at: Date.now(), fetchedAt: Date.now(), issues, error: null } },
+    if (cache.state?.id === id && Date.now() - cache.state.at < JIRA_CACHE_MS) return cache.state
+    cache.loading ??= fetchMyIssues(cfg, jiraFetch, { done: kind === 'done' }).then(
+      (issues) => { cache.state = { id, at: Date.now(), fetchedAt: Date.now(), issues, error: null } },
       (e) => {
-        const prev = jira?.id === id ? jira : null
-        jira = { id, at: Date.now(), fetchedAt: prev?.fetchedAt ?? null, issues: prev?.issues ?? [], error: e.message }
+        const prev = cache.state?.id === id ? cache.state : null
+        cache.state = { id, at: Date.now(), fetchedAt: prev?.fetchedAt ?? null, issues: prev?.issues ?? [], error: e.message }
       }
-    ).finally(() => { jiraLoading = null })
-    await jiraLoading
-    return jira
+    ).finally(() => { cache.loading = null })
+    await cache.loading
+    return cache.state
+  }
+
+  // Los estados del proyecto según Jira, para el filtro. Si Jira no responde, lista vacía: el panel usa los de las filas.
+  async function jiraStatuses(cfg) {
+    const id = `${cfg.site}|${cfg.project}`
+    if (jiraStatusList?.id === id && Date.now() - jiraStatusList.at < JIRA_STATUSES_MS) return jiraStatusList.list
+    let list = []
+    try {
+      list = await fetchProjectStatuses(cfg, jiraFetch)
+    } catch (e) {
+      console.error(`no pude leer los estados de Jira: ${e.message}`)
+      // Se reintenta en unos minutos, no en cada consulta del panel.
+      list = jiraStatusList?.id === id ? jiraStatusList.list : []
+      jiraStatusList = { id, at: Date.now() - JIRA_STATUSES_MS + JIRA_CACHE_MS, list }
+      return list
+    }
+    jiraStatusList = { id, at: Date.now(), list }
+    return list
   }
 
   // Las ramas de origin de cada repo, tal como quedaron del último fetch. Solo lectura.
@@ -789,10 +824,15 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     return data
   }
 
-  async function jiraView() {
+  // `hideParam`: los estados que el panel eligió ocultar (JSON); sin él, los de por defecto (Testing y los terminados).
+  async function jiraView(hideParam = null) {
     const cfg = readPolicy().jira
     if (!cfg) return { enabled: false }
-    const state = await jiraIssues(cfg)
+    const statuses = await jiraStatuses(cfg)
+    const defaults = defaultHidden(cfg.hideStatuses, statuses)
+    const hidden = hiddenFrom(hideParam) ?? defaults
+    const doneShown = doneStatuses(statuses).some((n) => !sameName(hidden, n))
+    const [state, doneState] = await Promise.all([jiraIssues(cfg), doneShown ? jiraIssues(cfg, 'done') : null])
     let worktrees = []
     let open = new Set()
     try {
@@ -806,10 +846,21 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     } catch {
       // Sin la lista de repos no se marca "rama pusheada"; lo demás sale igual.
     }
-    const all = jiraRows(state.issues, { site: cfg.site, worktrees, open, remembered: readStarts(), extra: (key) => ({ ...harnessOf(cfg.tickets, key), pushed: pushedIn(key, remotes) }) })
-    const issues = visibleRows(all, cfg.hideStatuses)
-    const sections = jiraSections(issues, { order: cfg.sections, staleDays: cfg.staleDays })
-    return { enabled: true, project: cfg.project, fetchedAt: state.fetchedAt, error: state.error, staleDays: cfg.staleDays, issues, sections, allKeys: all.map((t) => t.key) }
+    const rowsOf = (list) => jiraRows(list, { site: cfg.site, worktrees, open, remembered: readStarts(), extra: (key) => ({ ...harnessOf(cfg.tickets, key), pushed: pushedIn(key, remotes) }) })
+    const all = rowsOf(state.issues)
+    const openKeys = new Set(all.map((t) => t.key))
+    const finished = doneState ? rowsOf(doneState.issues.filter((i) => !openKeys.has(i.key))) : []
+    const issues = visibleRows([...all, ...finished], hidden)
+    const sections = jiraSections(issues, { order: cfg.sections, tail: defaults, staleDays: cfg.staleDays })
+    // El filtro lista los estados de Jira y, por si la lista no llegó, los que aparecen en las filas.
+    const known = [...statuses]
+    for (const r of [...all, ...finished]) if (r.status && !sameName(known.map((k) => k.name), r.status)) known.push({ name: r.status, category: r.category })
+    return {
+      enabled: true, project: cfg.project, fetchedAt: state.fetchedAt, error: state.error ?? doneState?.error ?? null, staleDays: cfg.staleDays, issues, sections,
+      statuses: known, hidden, defaultHidden: defaults, done: doneShown ? { days: DONE_DAYS, max: DONE_MAX, count: finished.length } : null,
+      // Los avisos comparan solo los abiertos, también los ocultos: un ticket que se cierra no es uno nuevo.
+      allKeys: all.map((t) => t.key)
+    }
   }
 
   // Lo que hace falta para arrancar un ticket en un repo: la rama nueva, de qué base sale y el primer mensaje. No escribe
@@ -837,7 +888,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
 
   async function myIssue(cfg, key) {
     if (!JIRA_KEY_RE.test(key ?? '')) throw new ActionError('Ticket inválido.')
-    const issue = (await jiraIssues(cfg)).issues.find((i) => i.key === key)
+    const issue = (await jiraIssues(cfg)).issues.find((i) => i.key === key) ?? jiraCaches.done.state?.issues.find((i) => i.key === key)
     if (!issue) throw new ActionError('Ese ticket no está entre los tuyos.')
     return issue
   }
@@ -864,11 +915,15 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     try {
       const move = (await fetchTransitions(cfg, key, jiraFetch)).find((t) => t.id === String(id))
       if (!move) throw new ActionError('Jira ya no ofrece esa transición para este ticket: refrescá.')
+      const from = issue.fields?.status?.name ?? null
       await applyTransition(cfg, key, move.id, jiraFetch)
       issue.fields = { ...issue.fields, status: { name: move.to, statusCategory: { key: move.category } }, updated: new Date().toISOString() }
-      // La búsqueda trae solo lo que no está terminado.
-      if (move.category === DONE_CATEGORY && jira?.issues) jira.issues = jira.issues.filter((i) => i !== issue)
-      return { key, status: move.to }
+      // Pasa a la caché que le toca: los abiertos o los terminados (si se están mirando; si no, aparece al prenderlos).
+      for (const cache of Object.values(jiraCaches)) if (cache.state) cache.state.issues = cache.state.issues.filter((i) => i !== issue)
+      const target = jiraCaches[move.category === DONE_CATEGORY ? 'done' : 'open'].state
+      if (target) target.issues.unshift(issue)
+      // Jira ya cambió: si el rastro no se pudo escribir, se avisa, pero la transición cuenta como hecha.
+      return { key, from, status: move.to, ...writeTrail(cfg.tickets, key, from, move.to) }
     } catch (e) {
       throw e instanceof ActionError ? e : new ActionError(e.message)
     }
@@ -1033,7 +1088,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     lastUse = Date.now()
     if (url.pathname === '/api/ping') return reply(res, 200, { ok: true })
     if (url.pathname === '/api/pitwall') return reply(res, 200, await pitwallSnapshot())
-    if (url.pathname === '/api/jira') return reply(res, 200, await jiraView())
+    if (url.pathname === '/api/jira') return reply(res, 200, await jiraView(q.get('hide')))
     if (url.pathname === '/api/jira-start') return reply(res, 200, await jiraStartPlan(q.get('key'), q.get('repo')))
     if (url.pathname === '/api/jira-transitions') return reply(res, 200, await jiraTransitions(q.get('key')))
     if (url.pathname === '/api/jira-targets') return reply(res, 200, { projects: await jiraTargetList().catch(() => { throw new ActionError('No pude leer los workspaces de Orca.') }) })

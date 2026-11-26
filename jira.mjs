@@ -1,6 +1,7 @@
 // Tus tickets de Jira: consulta de solo lectura, con caché, y la lógica para mostrarlos y avisar los nuevos.
 // Lo de armar filas y detectar nuevos es puro, para que test.mjs lo pruebe con datos inventados.
-import { readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { flatten, isTerminal } from './pitwall.mjs'
 
 const BRIEF_MAX = 220
@@ -24,6 +25,14 @@ const BLOCKER_RE = /^\s*(?:[-*]\s*)?⛔\s*\**\s*Decisi[oó]n de negocio\s*\**\s*
 export const BLOCKER_FILES = ['roadmap.md', 'US.md']
 const SLUG_MAX = 40
 const REMEMBER_MAX = 5
+// Los terminados no tienen fin: se traen solo los que cambiaron hace poco, y con tope.
+export const DONE_DAYS = 30
+export const DONE_MAX = 50
+const DONE_CATEGORY = 'done'
+// Sin la lista de estados de Jira, el terminado se reconoce por este nombre.
+const DONE_FALLBACK = 'Done'
+// Las marcas que leen los scripts del harness en roadmap.md (⛔ ✅ 🚧 ↪): un nombre de estado no puede imitarlas.
+const HARNESS_MARKS_RE = /[\u26D4\u2705\u{1F6A7}\u21AA]/gu
 
 // La configuración de `jira` en policy.json, validada. Sin ella (o inválida), no hay pestaña Jira.
 export function jiraConfig(raw, expand = (p) => p) {
@@ -50,22 +59,23 @@ export function jiraConfig(raw, expand = (p) => p) {
 }
 
 const names = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()) : null)
-const sameName = (list, name) => list.some((x) => x.toLowerCase() === String(name ?? '').toLowerCase())
+export const sameName = (list, name) => list.some((x) => x.toLowerCase() === String(name ?? '').toLowerCase())
 
 // Saca los tickets en un estado oculto.
 export const visibleRows = (rows, hide) => rows.filter((r) => !sameName(hide, r.status))
 
 // Las secciones del panel: «En curso» (lo que no está en una sección propia, o tiene workspace en Orca) y una por
-// estado de `order`, en ese orden. Dentro, lo más reciente primero, y lo viejo aparte.
-export function jiraSections(rows, { order = null, staleDays = STALE_DAYS, now = Date.now() } = {}) {
-  const own = order ?? [...new Set(rows.filter((r) => r.category === 'new').map((r) => r.status))]
-  const byId = new Map([[IN_PROGRESS, []], ...own.map((n) => [n.toLowerCase(), []])])
+// estado de `order`, en ese orden. Al final, una por estado de `tail` (los que se ocultan por defecto, como Testing y
+// Done, cuando los prendés): esos van en la suya aunque tengan workspace. Dentro, lo más reciente primero, y lo viejo aparte.
+export function jiraSections(rows, { order = null, tail = [], staleDays = STALE_DAYS, now = Date.now() } = {}) {
+  const own = (order ?? [...new Set(rows.filter((r) => r.category === 'new').map((r) => r.status))]).filter((n) => !sameName(tail, n))
+  const byId = new Map([[IN_PROGRESS, []], ...[...own, ...tail].map((n) => [n.toLowerCase(), []])])
   for (const r of rows) {
-    const id = !r.sessions.length && sameName(own, r.status) ? String(r.status).toLowerCase() : IN_PROGRESS
+    const id = sameName(tail, r.status) || (!r.sessions.length && sameName(own, r.status)) ? String(r.status).toLowerCase() : IN_PROGRESS
     byId.get(id).push(r)
   }
   const limit = now - staleDays * DAY_MS
-  return [IN_PROGRESS, ...own].flatMap((title) => {
+  return [IN_PROGRESS, ...own, ...tail].flatMap((title) => {
     const list = byId.get(title === IN_PROGRESS ? title : title.toLowerCase()).sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))
     if (!list.length) return []
     const old = (r) => !r.sessions.length && r.updated != null && r.updated < limit
@@ -292,10 +302,12 @@ async function jiraCall(config, path, fetchImpl, { method = 'GET', body } = {}) 
   return data
 }
 
-// GET de solo lectura a la búsqueda de Jira.
-export async function fetchMyIssues(config, fetchImpl = fetch) {
-  const jql = `project = ${config.project} AND assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC`
-  const data = await jiraCall(config, `/rest/api/3/search/jql?${new URLSearchParams({ jql, fields: FIELDS, maxResults: String(MAX_RESULTS) })}`, fetchImpl)
+// GET de solo lectura a la búsqueda de Jira: tus tickets abiertos o, con `done`, los terminados de los últimos días.
+export async function fetchMyIssues(config, fetchImpl = fetch, { done = false } = {}) {
+  const jql = done
+    ? `project = ${config.project} AND assignee = currentUser() AND statusCategory = Done AND updated >= -${DONE_DAYS}d ORDER BY updated DESC`
+    : `project = ${config.project} AND assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC`
+  const data = await jiraCall(config, `/rest/api/3/search/jql?${new URLSearchParams({ jql, fields: FIELDS, maxResults: String(done ? DONE_MAX : MAX_RESULTS) })}`, fetchImpl)
   return Array.isArray(data?.issues) ? data.issues.filter((it) => typeof it?.key === 'string') : []
 }
 
@@ -313,4 +325,62 @@ export async function fetchTransitions(config, key, fetchImpl = fetch) {
 // Cambia el estado del ticket. Escribe en Jira: solo se llama con un id que Jira acaba de ofrecer para ese ticket.
 export async function applyTransition(config, key, id, fetchImpl = fetch) {
   await jiraCall(config, `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`, fetchImpl, { method: 'POST', body: { transition: { id } } })
+}
+
+// Los estados del proyecto, como los devuelve Jira (uno por nombre, en su orden), con su categoría.
+export function projectStatuses(data) {
+  const seen = new Map()
+  for (const type of Array.isArray(data) ? data : []) {
+    for (const st of Array.isArray(type?.statuses) ? type.statuses : []) {
+      if (typeof st?.name === 'string' && st.name.trim() && !seen.has(st.name.toLowerCase())) seen.set(st.name.toLowerCase(), { name: st.name, category: st.statusCategory?.key ?? null })
+    }
+  }
+  return [...seen.values()]
+}
+
+export async function fetchProjectStatuses(config, fetchImpl = fetch) {
+  return projectStatuses(await jiraCall(config, `/rest/api/3/project/${encodeURIComponent(config.project)}/statuses`, fetchImpl))
+}
+
+// Los estados terminados: los de categoría done de Jira o, sin la lista, «Done».
+export function doneStatuses(statuses) {
+  const names = statuses.filter((s) => s.category === DONE_CATEGORY).map((s) => s.name)
+  return names.length ? names : [DONE_FALLBACK]
+}
+
+// Lo que se oculta si no elegiste otra cosa: lo de `hideStatuses` (Testing) y los terminados.
+export const defaultHidden = (hideStatuses, statuses) => [...new Set([...hideStatuses, ...doneStatuses(statuses)])]
+
+// La selección que manda el panel: una lista de nombres, o nada (y vale la de por defecto).
+export function hiddenFrom(raw) {
+  if (raw == null) return null
+  try {
+    return names(JSON.parse(raw))
+  } catch {
+    return null
+  }
+}
+
+const twoDigits = (n) => String(n).padStart(2, '0')
+const statusText = (name) => String(name ?? '?').replace(HARNESS_MARKS_RE, '').replace(/\s+/g, ' ').trim() || '?'
+
+// El rastro de un cambio de estado en el roadmap.md del ticket, con la hora local.
+export function trailLine(from, to, date = new Date()) {
+  const day = `${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())}`
+  return `- ${day} ${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())} Jira: ${statusText(from)} → ${statusText(to)} (desde Command Deck)`
+}
+
+// Agrega la línea al final del roadmap.md de la carpeta. Si no hay roadmap.md, no crea nada (devuelve false).
+// Toca solo ese archivo: el estado del harness (US.md, INDEX.md) no se cambia desde acá.
+export function appendTrail(folder, line) {
+  const file = join(folder, 'roadmap.md')
+  let text
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch (e) {
+    if (e.code === 'ENOENT') return false
+    throw e
+  }
+  appendFileSync(file, `${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`)
+  return true
 }

@@ -1,6 +1,6 @@
 // Prueba las acciones de la app contra un repo descartable en una carpeta temporal. No toca los repos reales.
 import { execFileSync } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -113,7 +113,18 @@ const adf = (...content) => ({ type: 'doc', version: 1, content })
 const parrafo = (text, bold = false) => ({ type: 'paragraph', content: [{ type: 'text', text, ...(bold ? { marks: [{ type: 'strong' }] } : {}) }] })
 const jiraPedidos = []
 const transPedidos = []
+const estadosPedidos = []
+const terminadosPedidos = []
 const jiraFalso = async (url, init) => {
+  if (url.endsWith('/rest/api/3/project/ABC/statuses')) {
+    estadosPedidos.push(url)
+    const sts = [['To Do', 'new'], ['En curso', 'indeterminate'], ['Testing', 'indeterminate'], ['Done', 'done']]
+    return new Response(JSON.stringify([{ name: 'Task', statuses: sts.map(([name, key]) => ({ name, statusCategory: { key } })) }, { name: 'Bug', statuses: [{ name: 'done', statusCategory: { key: 'done' } }] }]), { status: 200 })
+  }
+  if (decodeURIComponent(url.replace(/\+/g, ' ')).includes('statusCategory = Done AND')) {
+    terminadosPedidos.push(url)
+    return new Response(JSON.stringify({ issues: [{ key: 'ABC-5', fields: { summary: 'Ya hecho', updated: new Date().toISOString(), status: { name: 'Done', statusCategory: { key: 'done' } }, description: null } }] }), { status: 200 })
+  }
   if (url.includes('/transitions')) {
     transPedidos.push({ url, method: init.method, body: init.body, auth: init.headers.Authorization })
     if (init.method === 'POST') return JSON.parse(init.body).transition.id === '31' ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ errorMessages: [], errors: { resolution: 'Falta la resolución.' } }), { status: 400 })
@@ -382,6 +393,20 @@ try {
   const secs = jiraSections(visibleRows(filasJ, ['Testing']), { order: ['Bloqueados', 'To Do', 'Draft'], staleDays: 90, now: 1000 * dia })
   check('jira: una sección por estado en el orden pedido, con workspace o en otro estado van a En curso', secs.map((x) => `${x.title}:${x.keys.join('+')}`).join() === 'En curso:A-6+A-4,Bloqueados:A-3,To Do:A-2,Draft:A-5')
   check('jira: lo que no cambia hace más de 90 días va aparte', secs.find((x) => x.title === 'To Do').staleKeys.join() === 'A-1')
+  const { defaultHidden, doneStatuses, hiddenFrom, projectStatuses, trailLine, appendTrail } = await import('./jira.mjs')
+  const secsCola = jiraSections([...filasJ, { key: 'A-9', status: 'Done', sessions: [{}], updated: 999 * dia }], { order: ['To Do'], tail: ['Testing', 'Done'], staleDays: 90, now: 1000 * dia })
+  check('jira: los estados ocultos por defecto, si se prenden, van al final en su sección, aunque tengan workspace', secsCola.map((x) => x.title).slice(-1).join() === 'Done' && secsCola.at(-1).keys.join() === 'A-9')
+  const ests = projectStatuses([{ statuses: [{ name: 'To Do', statusCategory: { key: 'new' } }, { name: 'Done', statusCategory: { key: 'done' } }] }, { statuses: [{ name: 'to do' }, { name: '' }] }])
+  check('jira: los estados del proyecto salen de Jira, sin repetir', ests.map((x) => x.name + '/' + x.category).join() === 'To Do/new,Done/done' && projectStatuses(null).length === 0)
+  check('jira: por defecto se ocultan Testing y los terminados; sin lista de Jira, «Done»', defaultHidden(['Testing'], ests).join() === 'Testing,Done' && doneStatuses([]).join() === 'Done')
+  check('jira: la selección del panel se valida', hiddenFrom('["Testing", 3, ""]').join() === 'Testing' && hiddenFrom('[]').length === 0 && hiddenFrom('x') === null && hiddenFrom(null) === null && hiddenFrom('{}') === null)
+  check('jira: la línea del rastro lleva fecha, hora, estados y no imita las marcas del harness', trailLine('To Do', '🚧 Bloq\nueados ⛔✅↪', new Date(2026, 0, 2, 3, 4)) === '- 2026-01-02 03:04 Jira: To Do → Bloq ueados (desde Command Deck)')
+  const sinRoadmap = join(tmp, 'sin-roadmap')
+  mkdirSync(sinRoadmap)
+  check('jira: sin roadmap.md no se crea nada', appendTrail(sinRoadmap, '- x') === false && !existsSync(join(sinRoadmap, 'roadmap.md')))
+  writeFileSync(join(sinRoadmap, 'roadmap.md'), '# R\n- a')
+  appendTrail(sinRoadmap, '- b')
+  check('jira: el rastro va en su propio renglón aunque el archivo no termine en salto', readFileSync(join(sinRoadmap, 'roadmap.md'), 'utf8') === '# R\n- a\n- b\n')
   const n0 = jiraNews(null, ['ABC-1'], 10)
   check('jira: la primera vuelta solo toma nota', n0.fresh.length === 0 && n0.known['ABC-1'] === 0)
   const n1 = jiraNews(n0.known, ['ABC-1', 'ABC-2'], 20)
@@ -448,6 +473,24 @@ try {
   const trasMover = (await call('/api/jira'))[1]
   check('/api/jira-transition hace el POST con el id y las mismas credenciales', codigoOk === 200 && ok.status === 'Testing' && JSON.parse(post.body).transition.id === '31' && post.auth === `Basic ${Buffer.from('persona@example.com:token-de-prueba').toString('base64')}`)
   check('/api/jira-transition: la lista toma el estado nuevo (Testing se oculta)', !trasMover.issues.some((t) => t.key === 'ABC-8') && trasMover.allKeys.includes('ABC-8'))
+  const roadmap8 = join(tickets, 'ABC-8-mails/roadmap.md')
+  const us8 = readFileSync(join(tickets, 'ABC-8-mails/US.md'), 'utf8')
+  check('/api/jira-transition deja el rastro al final del roadmap.md del ticket', ok.trail === 'ok' && ok.from === 'To Do' && /\n- \d{4}-\d{2}-\d{2} \d{2}:\d{2} Jira: To Do → Testing \(desde Command Deck\)\n$/.test(readFileSync(roadmap8, 'utf8')) && readFileSync(roadmap8, 'utf8').startsWith('# Roadmap\n\n- ⛔'))
+  check('/api/jira-transition no toca US.md ni INDEX.md', readFileSync(join(tickets, 'ABC-8-mails/US.md'), 'utf8') === us8 && !readFileSync(join(tickets, 'INDEX.md'), 'utf8').includes('Testing'))
+  const [codigo7, mov7] = await call('/api/jira-transition', { key: 'ABC-7', id: '31' })
+  check('/api/jira-transition sin roadmap.md no crea nada', codigo7 === 200 && mov7.trail === 'none' && !existsSync(join(tickets, 'ABC-7-prueba/roadmap.md')))
+  chmodSync(roadmap8, 0o444)
+  const [codigoRo, ro] = await call('/api/jira-transition', { key: 'ABC-8', id: '31' })
+  chmodSync(roadmap8, 0o644)
+  check('/api/jira-transition: si no puede escribir el rastro, la transición cuenta igual y lo avisa', codigoRo === 200 && ro.status === 'Testing' && ro.trail === 'error' && ro.trailError)
+  const [, porDefecto] = await call('/api/jira')
+  check('/api/jira lista los estados de Jira y oculta por defecto Testing y los terminados', porDefecto.statuses.map((x) => x.name).join() === 'To Do,En curso,Testing,Done' && porDefecto.hidden.join() === 'Testing,Done' && porDefecto.done === null && terminadosPedidos.length === 0 && estadosPedidos.length === 1)
+  const [codigoTodos, todos] = await call('/api/jira?hide=' + encodeURIComponent('[]'))
+  const jqlDone = decodeURIComponent(terminadosPedidos[0]?.replace(/\+/g, ' ') ?? '')
+  check('/api/jira con Testing y Done prendidos los trae, con Done limitado a 30 días y 50', codigoTodos === 200 && ['ABC-5', 'ABC-7', 'ABC-8'].every((k) => todos.issues.some((t) => t.key === k)) && jqlDone.includes('updated >= -30d') && jqlDone.includes('maxResults=50') && todos.done.days === 30 && todos.done.max === 50 && todos.done.count === 1)
+  check('/api/jira: Testing y Done van en su sección al final; los avisos siguen comparando solo los abiertos', todos.sections.map((x) => x.title).slice(-2).join() === 'Testing,Done' && todos.sections.find((x) => x.title === 'Done').keys.join() === 'ABC-5' && !todos.allKeys.includes('ABC-5'))
+  const [, soloDone] = await call('/api/jira?hide=' + encodeURIComponent(JSON.stringify(['To Do', 'En curso', 'Testing'])))
+  check('/api/jira respeta la selección del panel', soloDone.issues.map((t) => t.key).join() === 'ABC-5' && soloDone.hidden.join() === 'To Do,En curso,Testing' && estadosPedidos.length === 1)
   const caido = await startServer({ orca: orcaFalso, jiraFetch: async () => new Response('{}', { status: 401 }) })
   const rCaido = await fetch(`http://127.0.0.1:${caido.port}/api/jira`, { headers: { 'X-Token': caido.token } })
   const jCaido = await rCaido.json()

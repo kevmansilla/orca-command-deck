@@ -292,3 +292,8 @@ button.label-h.fold.sub { margin:10px 0 6px; letter-spacing:.06em; text-transfor
 #tmenu .opt { min-height:26px; font-size:12px; }
 .pchip.tstatus.busy { cursor:progress; opacity:.75; }
 .item.ticket .terr { margin-top:4px; font-size:11px; color:var(--c-blocked); }
+/* Filtro de estados de la pestaña Jira: chips que se prenden y apagan. */
+.jfilter { margin:10px 0 2px; }
+.jfilter-l { font:600 9.5px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--muted); }
+.pchip.jstatus.off { color:var(--muted); border-style:dashed; border-color:var(--line); text-decoration:line-through; }
+.jnote { font-size:10.5px; color:var(--muted); margin-top:4px; }
