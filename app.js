@@ -376,6 +376,7 @@ document.getElementById('modal').onclick = function (e) { if (e.target === this)
 // Esc cierra primero el diálogo y, si no hay ninguno, el diff.
 document.addEventListener('keydown', function (e) {
   if (e.key !== 'Escape') return
+  if (statusMenu) return closeStatusMenu()
   var modal = document.getElementById('modal')
   if (modal.style.display && modal.style.display !== 'none') closeModal()
   else if (!/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) closeDiff()
@@ -809,6 +810,8 @@ var jiraKnown = {}
 var jiraSeen = 0
 var jiraSeenShown = 0
 var jiraFolded = {}
+// Cambios de estado en curso o fallidos, por ticket: { clave: { busy, error } }. El error queda en la tarjeta.
+var jiraMoves = {}
 
 function readView() {
   var linked = location.hash.slice(1) // #git, #prs…: abre directo en esa pestaña
@@ -1047,9 +1050,10 @@ function harnessChip(h) {
 }
 function ticketItem(t, fresh, dim) {
   var s = t.sessions[0]
+  var move = jiraMoves[t.key]
   var stuck = /bloque/i.test(t.status || '')
   var color = fresh ? 'var(--c-waiting)' : s ? 'var(--c-working)' : stuck ? 'var(--c-blocked)' : 'var(--c-idle)'
-  var chips = [chip(t.status || 'sin estado', stuck ? 'var(--c-blocked)' : JIRA_CATEGORY[t.category] || 'var(--muted)', 'Estado en Jira')]
+  var chips = [statusChip(t, stuck)]
   if (fresh) chips.push(chip('nuevo', 'var(--c-waiting)'))
   if (s) chips.push('<button class="pchip c" style="--c:var(--c-working)" data-tsession="' + esc(t.key) + '" title="' + esc(placesTitle(t.sessions)) + '"><span class="pdot"></span>' + esc(placesText(t.sessions)) + '</button>')
   chips.push(harnessChip(t.harness))
@@ -1059,8 +1063,88 @@ function ticketItem(t, fresh, dim) {
   chips.push('<button class="pchip" data-tjira="' + esc(t.key) + '" title="Abrir en Jira">Jira ↗</button>')
   return '<div class="item ticket' + (fresh ? ' unread' : '') + (dim ? ' seen' : '') + '" style="--c:' + color + '" data-ticket="' + esc(t.key) + '" title="' + esc(t.title) + '">' +
     '<div class="top"><span class="tag">' + esc(t.key) + '</span><span class="ititle trunc">' + (t.blocker ? '⛔ ' : '') + esc(t.title) + '</span><span class="ago">' + ago(t.updated) + '</span></div>' +
-    (t.brief ? '<div class="msg">' + esc(t.brief) + '</div>' : '') + '<div class="pchips">' + chips.join('') + '</div></div>'
+    (t.brief ? '<div class="msg">' + esc(t.brief) + '</div>' : '') + '<div class="pchips">' + chips.join('') + '</div>' +
+    (move && move.error ? '<div class="terr">No pude cambiar el estado: ' + esc(move.error) + '</div>' : '') + '</div>'
 }
+// El estado en Jira es un botón: abre el menú con las transiciones que Jira permite. Mientras se aplica, lo dice.
+function statusChip(t, stuck) {
+  var move = jiraMoves[t.key]
+  var color = stuck ? 'var(--c-blocked)' : JIRA_CATEGORY[t.category] || 'var(--muted)'
+  var text = (t.status || 'sin estado') + (move && move.busy ? ' · cambiando…' : ' ▾')
+  return '<button class="pchip c tstatus' + (move && move.busy ? ' busy' : '') + '" style="--c:' + color + '" data-tstatus="' + esc(t.key) + '"' +
+    (move && move.busy ? ' aria-disabled="true"' : '') + ' title="Estado en Jira · clic para cambiarlo" aria-haspopup="menu">' + esc(text) + '</button>'
+}
+// ---------- Menú de transiciones: lo que devuelve Jira para ese ticket, nada inventado ----------
+var statusMenu = null
+function closeStatusMenu() {
+  if (!statusMenu) return
+  statusMenu.remove()
+  statusMenu = null
+}
+function openStatusMenu(key) {
+  var t = ticketOf(key)
+  if (!t || (jiraMoves[key] && jiraMoves[key].busy)) return
+  var same = statusMenu && statusMenu.dataset.key === key
+  closeStatusMenu()
+  if (same) return // segundo clic en el mismo chip: lo cierra
+  if (jiraMoves[key]) { delete jiraMoves[key]; renderBoard() } // el error anterior se va al reintentar
+  var menu = el('div', 'list')
+  menu.id = 'tmenu'
+  menu.dataset.key = key
+  menu.setAttribute('role', 'menu')
+  menu.appendChild(el('div', 'opt-h', key + ' · pasar a'))
+  menu.appendChild(el('div', 'opt-h', 'Cargando…'))
+  document.body.appendChild(menu)
+  statusMenu = menu
+  placeStatusMenu(menu)
+  api('/api/jira-transitions?key=' + encodeURIComponent(key)).then(function (j) {
+    if (statusMenu !== menu) return
+    menu.removeChild(menu.lastChild)
+    // Jira también ofrece pasar al estado en que ya está: no cambia nada, no se muestra.
+    var moves = j.transitions.filter(function (tr) { return tr.to !== t.status })
+    if (!moves.length) menu.appendChild(el('div', 'opt-h', 'Jira no ofrece transiciones.'))
+    moves.forEach(function (tr) {
+      var o = el('div', 'opt')
+      o.setAttribute('role', 'menuitem')
+      o.appendChild(el('span', '', tr.name))
+      o.appendChild(el('span', 'meta', tr.to !== tr.name ? '→ ' + tr.to : ''))
+      o.onclick = function (e) { e.stopPropagation(); closeStatusMenu(); applyStatus(t, tr) }
+      menu.appendChild(o)
+    })
+    placeStatusMenu(menu)
+  }).catch(function (e) {
+    if (statusMenu !== menu) return
+    closeStatusMenu()
+    jiraMoves[key] = { error: e.message }
+    renderBoard()
+  })
+}
+// Debajo del chip, sin salirse del panel; si no entra abajo, arriba.
+// El chip se busca de nuevo: el tablero se redibuja con cada consulta.
+function placeStatusMenu(menu) {
+  var anchor = boardInner.querySelector('[data-tstatus="' + menu.dataset.key + '"]')
+  if (!anchor) return closeStatusMenu()
+  var r = anchor.getBoundingClientRect()
+  var w = menu.offsetWidth
+  var h = menu.offsetHeight
+  menu.style.left = Math.max(4, Math.min(r.left, window.innerWidth - w - 4)) + 'px'
+  menu.style.top = (r.bottom + 4 + h > window.innerHeight && r.top - 4 - h > 0 ? r.top - 4 - h : r.bottom + 4) + 'px'
+}
+function applyStatus(t, tr) {
+  jiraMoves[t.key] = { busy: true }
+  renderBoard()
+  send('/api/jira-transition', { key: t.key, id: tr.id }).then(function (r) {
+    delete jiraMoves[t.key]
+    toast(t.key + ' → ' + r.status, true)
+    return loadJira()
+  }, function (e) {
+    jiraMoves[t.key] = { error: e.message }
+    renderBoard()
+  })
+}
+document.addEventListener('click', function (e) { if (statusMenu && !statusMenu.contains(e.target)) closeStatusMenu() })
+board.addEventListener('scroll', closeStatusMenu)
+window.addEventListener('resize', closeStatusMenu)
 // Secciones plegables, por estado. Lo plegado se guarda; «viejos» arranca plegado.
 function isFolded(id) { return id in jiraFolded ? jiraFolded[id] : /\|viejos$/.test(id) }
 function foldHeading(id, title, n, cls) {
@@ -1091,7 +1175,7 @@ function jiraView() {
   if (jira.error) out += '<div class="alert" style="--c:var(--c-waiting)">No pude consultar Jira: ' + esc(jira.error) + (jira.fetchedAt ? ' Muestro lo de hace ' + short(jira.fetchedAt) + '.' : '') + '</div>'
   if (!jira.issues.length) out += heading('Mis tickets · ' + jira.project, 0) + '<div class="none">No tenés tickets abiertos en ' + esc(jira.project) + '.</div>'
   out += (jira.sections || []).map(ticketSection).join('')
-  return out + '<p class="hint">Clic en un ticket → su sesión en Orca, o Jira si no tiene. Jira se consulta cada 5 min' + (jira.fetchedAt ? ' · última hace ' + short(jira.fetchedAt) : '') + '.</p>'
+  return out + '<p class="hint">Clic en un ticket → su sesión en Orca, o Jira si no tiene. Clic en el estado → cambiarlo en Jira. Jira se consulta cada 5 min' + (jira.fetchedAt ? ' · última hace ' + short(jira.fetchedAt) : '') + '.</p>'
 }
 function ticketOf(key) { return jira && jira.issues ? jira.issues.filter(function (t) { return t.key === key })[0] : null }
 function openExternal(url) {
@@ -1320,8 +1404,9 @@ function openSession(a) {
   openInOrca(a.worktreeId, a.terminalId, a.path)
 }
 function onBoardClick(e) {
-  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice],[data-tjira],[data-tstart],[data-tsession],[data-ticket],[data-jfold]')
+  var t = e.target.closest('[data-filter],[data-view],[data-row],[data-ws],[data-notice],[data-tstatus],[data-tjira],[data-tstart],[data-tsession],[data-ticket],[data-jfold]')
   if (!t) return
+  if (t.dataset.tstatus) { e.stopPropagation(); return openStatusMenu(t.dataset.tstatus) }
   if (t.dataset.jfold) return toggleFold(t.dataset.jfold)
   if (t.dataset.tjira) return openTicket(t.dataset.tjira, true)
   if (t.dataset.tstart) return startPicker(t.dataset.tstart)

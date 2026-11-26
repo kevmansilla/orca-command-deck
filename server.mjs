@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { activateWorktree, createWorkspaceChat, focusTerminal, launchChat, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
-import { BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fillPrompt, jiraConfig, jiraRows, jiraSections, jiraTargets, pushedIn, rememberStart, sessionsOf, visibleRows } from './jira.mjs'
+import { applyTransition, BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fetchTransitions, fillPrompt, jiraConfig, jiraRows, jiraSections, jiraTargets, pushedIn, rememberStart, sessionsOf, TRANSITION_ID_RE, visibleRows } from './jira.mjs'
 import { buildSnapshot, isTerminal } from './pitwall.mjs'
 import { cachePath } from './state.mjs'
 
@@ -47,6 +47,7 @@ const REMOTE_REFS_MS = 2 * 60_000
 // El motivo de una falla de la CLI que se muestra en el panel; el completo va al journal.
 const CLI_REASON_MAX = 300
 const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]+-\d+$/
+const DONE_CATEGORY = 'done'
 const HARNESS_STATES = ['nuevo', 'planificado', 'en-progreso', 'en-review', 'en-correccion', 'listo-para-probar', 'listo-para-deploy', 'desplegado', 'bloqueado', 'descartado']
 const INLINE_STATE_RE = /\*\*Estado:\*\*\s*`?([a-z][a-z-]*[a-z])/
 const DEPLOYED_RE = /^- \*\*Estado:\*\*\s*`?ejecutado/m
@@ -841,6 +842,38 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     return issue
   }
 
+  // A qué estados puede pasar el ticket ahora, según Jira. Solo lectura.
+  async function jiraTransitions(key) {
+    const cfg = readPolicy().jira
+    if (!cfg) throw new ActionError('Jira no está configurado.')
+    await myIssue(cfg, key)
+    try {
+      return { key, transitions: await fetchTransitions(cfg, key, jiraFetch) }
+    } catch (e) {
+      throw new ActionError(e.message)
+    }
+  }
+
+  // Cambia el estado del ticket en Jira con una transición que Jira ofrece ahora para él (se vuelve a preguntar: el id
+  // viene de la página). Si sale bien, la caché toma el estado nuevo: la búsqueda de Jira puede tardar en reflejarlo.
+  async function jiraTransition({ key, id } = {}) {
+    const cfg = readPolicy().jira
+    if (!cfg) throw new ActionError('Jira no está configurado.')
+    if (!TRANSITION_ID_RE.test(String(id ?? ''))) throw new ActionError('Transición inválida.')
+    const issue = await myIssue(cfg, key)
+    try {
+      const move = (await fetchTransitions(cfg, key, jiraFetch)).find((t) => t.id === String(id))
+      if (!move) throw new ActionError('Jira ya no ofrece esa transición para este ticket: refrescá.')
+      await applyTransition(cfg, key, move.id, jiraFetch)
+      issue.fields = { ...issue.fields, status: { name: move.to, statusCategory: { key: move.category } }, updated: new Date().toISOString() }
+      // La búsqueda trae solo lo que no está terminado.
+      if (move.category === DONE_CATEGORY && jira?.issues) jira.issues = jira.issues.filter((i) => i !== issue)
+      return { key, status: move.to }
+    } catch (e) {
+      throw e instanceof ActionError ? e : new ActionError(e.message)
+    }
+  }
+
   const promptFor = (cfg, key, title) => fillPrompt(cfg.startPrompt, { key, title, url: `${cfg.site}/browse/${key}` })
 
   async function jiraTargetList() {
@@ -1002,6 +1035,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     if (url.pathname === '/api/pitwall') return reply(res, 200, await pitwallSnapshot())
     if (url.pathname === '/api/jira') return reply(res, 200, await jiraView())
     if (url.pathname === '/api/jira-start') return reply(res, 200, await jiraStartPlan(q.get('key'), q.get('repo')))
+    if (url.pathname === '/api/jira-transitions') return reply(res, 200, await jiraTransitions(q.get('key')))
     if (url.pathname === '/api/jira-targets') return reply(res, 200, { projects: await jiraTargetList().catch(() => { throw new ActionError('No pude leer los workspaces de Orca.') }) })
     if (url.pathname === '/api/repos') {
       if (q.get('fresh') === '1') expireSummaries()
@@ -1045,6 +1079,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     if (url.pathname === '/api/jira-chat') return reply(res, 200, await jiraChat(body))
     if (url.pathname === '/api/jira-open') return reply(res, 200, await jiraOpen(body))
     if (url.pathname === '/api/jira-new') return reply(res, 200, await jiraNewWorkspace(body))
+    if (url.pathname === '/api/jira-transition') return reply(res, 200, await jiraTransition(body))
     const item = repoOf(body.repo)
     if (url.pathname === '/api/run') {
       const { title, command } = await terminalCommand(item, body)

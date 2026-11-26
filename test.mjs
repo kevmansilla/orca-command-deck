@@ -112,7 +112,18 @@ const creados = []
 const adf = (...content) => ({ type: 'doc', version: 1, content })
 const parrafo = (text, bold = false) => ({ type: 'paragraph', content: [{ type: 'text', text, ...(bold ? { marks: [{ type: 'strong' }] } : {}) }] })
 const jiraPedidos = []
+const transPedidos = []
 const jiraFalso = async (url, init) => {
+  if (url.includes('/transitions')) {
+    transPedidos.push({ url, method: init.method, body: init.body, auth: init.headers.Authorization })
+    if (init.method === 'POST') return JSON.parse(init.body).transition.id === '31' ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ errorMessages: [], errors: { resolution: 'Falta la resolución.' } }), { status: 400 })
+    return new Response(JSON.stringify({ transitions: [
+      { id: '21', name: 'Empezar', isAvailable: true, to: { name: 'En curso', statusCategory: { key: 'indeterminate' } } },
+      { id: '31', name: 'Testing', isAvailable: true, to: { name: 'Testing', statusCategory: { key: 'indeterminate' } } },
+      { id: '41', name: 'Cerrar', isAvailable: true, to: { name: 'Done', statusCategory: { key: 'done' } } },
+      { id: '51', name: 'No disponible', isAvailable: false, to: { name: 'X' } }
+    ] }), { status: 200 })
+  }
   jiraPedidos.push({ url, auth: init.headers.Authorization })
   return new Response(JSON.stringify({ issues: [
     { key: 'ABC-8', fields: { summary: 'Revisar el envío de mails', updated: '2026-01-02T10:00:00.000-0300', status: { name: 'To Do', statusCategory: { key: 'new' } }, description: adf({ type: 'heading', content: [{ type: 'text', text: 'Contexto' }] }, parrafo('Ejemplo', true), parrafo('Hay que mandar los mails desde un solo lugar.'), { type: 'codeBlock', content: [{ type: 'text', text: 'select 1' }] }) } },
@@ -426,6 +437,17 @@ try {
   check('/api/jira-open rechaza un workspace que no es del ticket', (await call('/api/jira-open', { key: 'ABC-7', worktreeId: 'b1::/bots/k' }))[0] === 400)
   const [codigoNuevo, nuevo] = await call('/api/jira-new', { key: 'ABC-8', repo: 'app' })
   check('/api/jira-new crea el workspace con la rama del ticket desde origin/<base>', codigoNuevo === 200 && nuevo.branch === 'ABC-8-revisar-el-envio-de-mails' && nuevo.surface === 'terminal' && creados.length === 1 && creados[0].baseRef === 'origin/master' && creados[0].path === repo && creados[0].branch === nuevo.branch)
+  const [codigoTr, tr] = await call('/api/jira-transitions?key=ABC-8')
+  check('/api/jira-transitions lista solo lo que Jira ofrece y está disponible', codigoTr === 200 && tr.transitions.map((x) => `${x.id}:${x.name}>${x.to}`).join() === '21:Empezar>En curso,31:Testing>Testing,41:Cerrar>Done' && transPedidos.at(-1).url === 'https://jira.example.test/rest/api/3/issue/ABC-8/transitions' && transPedidos.at(-1).method === 'GET')
+  check('/api/jira-transitions rechaza un ticket ajeno o inválido sin consultar Jira', (await call('/api/jira-transitions?key=ABC-99'))[0] === 400 && (await call('/api/jira-transitions?key=x/../y'))[0] === 400 && transPedidos.length === 1)
+  check('/api/jira-transition rechaza un id que Jira no ofrece, sin POST', (await call('/api/jira-transition', { key: 'ABC-8', id: '99' }))[0] === 400 && (await call('/api/jira-transition', { key: 'ABC-8', id: '1;x' }))[0] === 400 && !transPedidos.some((x) => x.method === 'POST'))
+  const [codigoMal, mal] = await call('/api/jira-transition', { key: 'ABC-8', id: '21' })
+  check('/api/jira-transition muestra el error de Jira y deja el estado', codigoMal === 400 && /400: Falta la resolución/.test(mal.error) && !mal.error.includes('token-de-prueba') && (await call('/api/jira'))[1].issues.find((t) => t.key === 'ABC-8').status === 'To Do')
+  const [codigoOk, ok] = await call('/api/jira-transition', { key: 'ABC-8', id: '31' })
+  const post = transPedidos.filter((x) => x.method === 'POST').at(-1)
+  const trasMover = (await call('/api/jira'))[1]
+  check('/api/jira-transition hace el POST con el id y las mismas credenciales', codigoOk === 200 && ok.status === 'Testing' && JSON.parse(post.body).transition.id === '31' && post.auth === `Basic ${Buffer.from('persona@example.com:token-de-prueba').toString('base64')}`)
+  check('/api/jira-transition: la lista toma el estado nuevo (Testing se oculta)', !trasMover.issues.some((t) => t.key === 'ABC-8') && trasMover.allKeys.includes('ABC-8'))
   const caido = await startServer({ orca: orcaFalso, jiraFetch: async () => new Response('{}', { status: 401 }) })
   const rCaido = await fetch(`http://127.0.0.1:${caido.port}/api/jira`, { headers: { 'X-Token': caido.token } })
   const jCaido = await rCaido.json()

@@ -13,6 +13,8 @@ const DAY_MS = 86_400_000
 const IN_PROGRESS = 'En curso'
 const FIELDS = 'summary,status,description,updated'
 export const JIRA_TIMEOUT_MS = 20_000
+export const TRANSITION_ID_RE = /^\d{1,10}$/
+const JIRA_REASON_MAX = 200
 const PROJECT_RE = /^[A-Z][A-Z0-9_]{0,19}$/
 const AGENT_RE = /^[a-z][a-z0-9-]{0,30}$/
 const DEFAULT_PROMPT = 'Arrancamos {key}: {title}. Leé el ticket en Jira: {url}'
@@ -248,8 +250,8 @@ export function jiraNews(known, keys, now) {
   return { known: next, fresh }
 }
 
-// GET de solo lectura a la búsqueda de Jira. El token viaja solo en el encabezado: nunca en la URL ni en un error.
-export async function fetchMyIssues(config, fetchImpl = fetch) {
+// El encabezado de autenticación, del archivo de credenciales. El token no sale de acá: ni en la URL ni en un error.
+function jiraAuth(config) {
   let env
   try {
     env = parseEnv(readFileSync(config.credentials, 'utf8'))
@@ -257,16 +259,58 @@ export async function fetchMyIssues(config, fetchImpl = fetch) {
     throw new Error('No pude leer el archivo de credenciales de Jira.')
   }
   if (!env.JIRA_EMAIL || !env.JIRA_TOKEN) throw new Error('Al archivo de credenciales le faltan JIRA_EMAIL o JIRA_TOKEN.')
-  const auth = `Basic ${Buffer.from(`${env.JIRA_EMAIL}:${env.JIRA_TOKEN}`).toString('base64')}`
-  const jql = `project = ${config.project} AND assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC`
-  const url = `${config.site}/rest/api/3/search/jql?${new URLSearchParams({ jql, fields: FIELDS, maxResults: String(MAX_RESULTS) })}`
+  return `Basic ${Buffer.from(`${env.JIRA_EMAIL}:${env.JIRA_TOKEN}`).toString('base64')}`
+}
+
+// Lo que Jira explica cuando rechaza un pedido ({ errorMessages, errors }), corto. Es texto de Jira: no lleva el token.
+function jiraReason(data) {
+  const parts = [...(Array.isArray(data?.errorMessages) ? data.errorMessages : []), ...Object.values(data?.errors ?? {})]
+  return flatten(parts.filter((x) => typeof x === 'string' && x.trim()).join(' '), JIRA_REASON_MAX)
+}
+
+// Un pedido a la API de Jira con las credenciales de la pestaña. Devuelve el JSON (o null si no hay cuerpo).
+async function jiraCall(config, path, fetchImpl, { method = 'GET', body } = {}) {
+  const headers = { Authorization: jiraAuth(config), Accept: 'application/json' }
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
   let r
   try {
-    r = await fetchImpl(url, { headers: { Authorization: auth, Accept: 'application/json' }, signal: AbortSignal.timeout(JIRA_TIMEOUT_MS) })
+    r = await fetchImpl(`${config.site}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(JIRA_TIMEOUT_MS) })
   } catch (e) {
     throw new Error(e?.name === 'TimeoutError' ? 'Jira no respondió a tiempo.' : 'No pude conectarme con Jira.')
   }
-  if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? `Jira rechazó las credenciales (${r.status}).` : `Jira respondió ${r.status}.`)
-  const data = await r.json()
+  const text = await r.text().catch(() => '')
+  let data = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    // Jira respondió algo que no es JSON (una página de error): queda el código.
+  }
+  if (!r.ok) {
+    const reason = jiraReason(data)
+    throw new Error(r.status === 401 || r.status === 403 ? `Jira rechazó las credenciales (${r.status}).` : `Jira respondió ${r.status}${reason ? `: ${reason}` : '.'}`)
+  }
+  return data
+}
+
+// GET de solo lectura a la búsqueda de Jira.
+export async function fetchMyIssues(config, fetchImpl = fetch) {
+  const jql = `project = ${config.project} AND assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC`
+  const data = await jiraCall(config, `/rest/api/3/search/jql?${new URLSearchParams({ jql, fields: FIELDS, maxResults: String(MAX_RESULTS) })}`, fetchImpl)
   return Array.isArray(data?.issues) ? data.issues.filter((it) => typeof it?.key === 'string') : []
+}
+
+// Las transiciones que Jira permite ahora para un ticket, tal como las devuelve: id, nombre y estado al que lleva.
+export function transitionsOf(data) {
+  return (Array.isArray(data?.transitions) ? data.transitions : [])
+    .filter((t) => TRANSITION_ID_RE.test(String(t?.id ?? '')) && t.isAvailable !== false && typeof t.name === 'string')
+    .map((t) => ({ id: String(t.id), name: t.name, to: t.to?.name ?? t.name, category: t.to?.statusCategory?.key ?? null }))
+}
+
+export async function fetchTransitions(config, key, fetchImpl = fetch) {
+  return transitionsOf(await jiraCall(config, `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`, fetchImpl))
+}
+
+// Cambia el estado del ticket. Escribe en Jira: solo se llama con un id que Jira acaba de ofrecer para ese ticket.
+export async function applyTransition(config, key, id, fetchImpl = fetch) {
+  await jiraCall(config, `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`, fetchImpl, { method: 'POST', body: { transition: { id } } })
 }

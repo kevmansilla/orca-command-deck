@@ -287,3 +287,8 @@ button.label-h.fold.sub { margin:10px 0 6px; letter-spacing:.06em; text-transfor
 .opt-p { padding:4px 8px 0; font-size:11px; font-weight:600; color:var(--soft); }
 .opt.busy .meta { color:var(--c-working); }
 .opt.new span:first-child { color:var(--primary); }
+/* Menú de transiciones de Jira: flota junto al chip de estado, con el estilo de los selectores. */
+#tmenu { position:fixed; z-index:20; min-width:180px; max-width:calc(100% - 8px); max-height:50vh; overflow:auto; padding:4px; background:var(--orca-popover, var(--card)); color:var(--orca-popover-foreground, var(--fg)); border:1px solid var(--line); border-radius:var(--radius); box-shadow:0 8px 24px #0006; }
+#tmenu .opt { min-height:26px; font-size:12px; }
+.pchip.tstatus.busy { cursor:progress; opacity:.75; }
+.item.ticket .terr { margin-top:4px; font-size:11px; color:var(--c-blocked); }
