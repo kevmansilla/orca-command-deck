@@ -2,15 +2,16 @@
 // y nunca commitea ni pushea en una rama desplegada.
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
-import { activateWorktree, focusTerminal, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
-import { BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fillPrompt, jiraConfig, jiraRows, jiraSections, pushedIn, visibleRows } from './jira.mjs'
+import { activateWorktree, createWorkspaceChat, focusTerminal, launchChat, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
+import { BLOCKER_FILES, blockerIn, branchFor, fetchMyIssues, fillPrompt, jiraConfig, jiraRows, jiraSections, jiraTargets, pushedIn, rememberStart, sessionsOf, visibleRows } from './jira.mjs'
 import { buildSnapshot, isTerminal } from './pitwall.mjs'
+import { cachePath } from './state.mjs'
 
 const HOME = homedir()
 const INDEX = fileURLToPath(new URL('./index.html', import.meta.url))
@@ -43,6 +44,8 @@ const PITWALL_CACHE_MS = 2_000
 // Jira se consulta como mucho cada 5 minutos; las ramas del remoto (del último fetch, sin fetch nuevo), cada 2.
 const JIRA_CACHE_MS = 5 * 60_000
 const REMOTE_REFS_MS = 2 * 60_000
+// El motivo de una falla de la CLI que se muestra en el panel; el completo va al journal.
+const CLI_REASON_MAX = 300
 const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]+-\d+$/
 const HARNESS_STATES = ['nuevo', 'planificado', 'en-progreso', 'en-review', 'en-correccion', 'listo-para-probar', 'listo-para-deploy', 'desplegado', 'bloqueado', 'descartado']
 const INLINE_STATE_RE = /\*\*Estado:\*\*\s*`?([a-z][a-z-]*[a-z])/
@@ -728,9 +731,9 @@ function botDirs() {
   })
 }
 
-const ORCA = { worktrees: orcaWorktrees, sessions: openSessions, bots: botDirs, focus: focusTerminal, activate: activateWorktree }
+const ORCA = { worktrees: orcaWorktrees, sessions: openSessions, bots: botDirs, focus: focusTerminal, activate: activateWorktree, launchChat, createWorkspaceChat }
 
-export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTerminal, orca = ORCA, jiraFetch = fetch } = {}) {
+export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTerminal, orca = ORCA, jiraFetch = fetch, startsFile = cachePath('jira-arranques.json') } = {}) {
   const token = process.env.MRG_TOKEN ?? randomBytes(32).toString('base64url')
   // Se lee una sola vez: si el plugin se actualiza, un servidor viejo no debe servir una página que no sabe atender.
   const page = readFileSync(INDEX)
@@ -790,8 +793,9 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     if (!cfg) return { enabled: false }
     const state = await jiraIssues(cfg)
     let worktrees = []
+    let open = new Set()
     try {
-      worktrees = await orca.worktrees()
+      ;[worktrees, open] = await Promise.all([orca.worktrees(), orca.sessions().catch(() => new Set())])
     } catch {
       // Sin Orca no se sabe qué tickets tienen workspace; la lista sale igual.
     }
@@ -801,7 +805,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     } catch {
       // Sin la lista de repos no se marca "rama pusheada"; lo demás sale igual.
     }
-    const all = jiraRows(state.issues, { site: cfg.site, worktrees, extra: (key) => ({ ...harnessOf(cfg.tickets, key), pushed: pushedIn(key, remotes) }) })
+    const all = jiraRows(state.issues, { site: cfg.site, worktrees, open, remembered: readStarts(), extra: (key) => ({ ...harnessOf(cfg.tickets, key), pushed: pushedIn(key, remotes) }) })
     const issues = visibleRows(all, cfg.hideStatuses)
     const sections = jiraSections(issues, { order: cfg.sections, staleDays: cfg.staleDays })
     return { enabled: true, project: cfg.project, fetchedAt: state.fetchedAt, error: state.error, staleDays: cfg.staleDays, issues, sections, allKeys: all.map((t) => t.key) }
@@ -812,9 +816,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
   async function jiraStartPlan(key, repoKey) {
     const cfg = readPolicy().jira
     if (!cfg) throw new ActionError('Jira no está configurado.')
-    if (!JIRA_KEY_RE.test(key ?? '')) throw new ActionError('Ticket inválido.')
-    const issue = (await jiraIssues(cfg)).issues.find((i) => i.key === key)
-    if (!issue) throw new ActionError('Ese ticket no está entre los tuyos.')
+    const issue = await myIssue(cfg, key)
     const item = listRepos().find((r) => r.key === repoKey && !r.worktreeOf)
     if (!item) throw new ActionError('Repo desconocido.')
     const { base, blocked } = await policy(item.path)
@@ -828,8 +830,88 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     const existing = refs.map((r) => r.replace(/^refs\/(heads|remotes)\//, '')).filter((b) => same.test(b.replace(/^origin\//, '')))
     return {
       key, title, repo: item.name, group: item.group ?? '', path: item.path, base, baseRef: `origin/${base}`, branch, existing, agent: cfg.agent,
-      prompt: fillPrompt(cfg.startPrompt, { key, title, url: `${cfg.site}/browse/${key}` })
+      prompt: promptFor(cfg, key, title)
     }
+  }
+
+  async function myIssue(cfg, key) {
+    if (!JIRA_KEY_RE.test(key ?? '')) throw new ActionError('Ticket inválido.')
+    const issue = (await jiraIssues(cfg)).issues.find((i) => i.key === key)
+    if (!issue) throw new ActionError('Ese ticket no está entre los tuyos.')
+    return issue
+  }
+
+  const promptFor = (cfg, key, title) => fillPrompt(cfg.startPrompt, { key, title, url: `${cfg.site}/browse/${key}` })
+
+  async function jiraTargetList() {
+    const [worktrees, open] = await Promise.all([orca.worktrees(), orca.sessions().catch(() => new Set())])
+    return jiraTargets(worktrees, listRepos(), open)
+  }
+
+  // Dónde arrancaste cada ticket desde el panel: { clave: [{ worktreeId, sessionId, at }] }. Sobrevive a un reinicio.
+  const readStarts = () => readJson(startsFile) ?? {}
+  function remember(key, worktreeId, sessionId) {
+    try {
+      mkdirSync(dirname(startsFile), { recursive: true })
+      writeFileSync(startsFile, JSON.stringify(rememberStart(readStarts(), key, { worktreeId, sessionId: sessionId ?? null, at: Date.now() })))
+    } catch (e) {
+      console.error(`no pude recordar dónde arrancó ${key}: ${e.message}`) // el chat ya está abierto: se pierde solo el atajo
+    }
+  }
+
+  // Un chat nativo nuevo en un workspace que ya está abierto. No crea ramas ni toca git.
+  // `place`: jiraOpen ya comprobó que el workspace es uno del ticket.
+  async function jiraChat({ key, worktreeId } = {}, place = false) {
+    const cfg = readPolicy().jira
+    if (!cfg) throw new ActionError('Jira no está configurado.')
+    const issue = await myIssue(cfg, key)
+    const known = place || (await jiraTargetList()).some((p) => p.workspaces.some((w) => w.worktreeId === worktreeId))
+    if (!known) throw new ActionError('Ese workspace ya no está en Orca.')
+    let result
+    try {
+      result = await orca.launchChat({ worktreeId, agent: cfg.agent, prompt: promptFor(cfg, key, issue.fields?.summary ?? key) })
+    } catch (e) {
+      throw new ActionError(`Orca no pudo abrir el chat: ${String(e.message).slice(0, CLI_REASON_MAX)}`)
+    }
+    remember(key, worktreeId, result.sessionId)
+    return { action: 'chat', surface: result.surface, detail: result.detail }
+  }
+
+  // Clic en un ticket que ya está en Orca: si ese workspace tiene un chat abierto, lo muestra (Orca no deja elegir qué
+  // pestaña de chat: abre el workspace); si solo tiene terminales o nada, abre ahí un chat nativo nuevo.
+  async function jiraOpen({ key, worktreeId } = {}) {
+    const cfg = readPolicy().jira
+    if (!cfg) throw new ActionError('Jira no está configurado.')
+    await myIssue(cfg, key)
+    const [worktrees, open] = await Promise.all([orca.worktrees(), orca.sessions().catch(() => new Set())])
+    const place = sessionsOf(key, worktrees, open, readStarts()[key] ?? []).find((p) => p.worktreeId === worktreeId)
+    if (!place) throw new ActionError('Ese workspace ya no está en Orca.')
+    if (!place.chats) return jiraChat({ key, worktreeId }, true)
+    try {
+      await orca.activate(worktreeId)
+    } catch (e) {
+      console.error(`worktree.activate falló: ${e.message}`)
+      throw new ActionError(`Orca no pudo abrir el workspace: ${String(e.message).slice(0, CLI_REASON_MAX)}`)
+    }
+    return { action: 'opened' }
+  }
+
+  // Workspace nuevo con la rama del ticket desde origin/<base>, y el chat ahí. El plan se vuelve a armar acá.
+  async function jiraNewWorkspace({ key, repo } = {}) {
+    const plan = await jiraStartPlan(key, repo)
+    let result
+    try {
+      result = await orca.createWorkspaceChat({ path: plan.path, branch: plan.branch, baseRef: plan.baseRef, agent: plan.agent, prompt: plan.prompt })
+    } catch (e) {
+      throw new ActionError(`Orca no pudo crear el workspace: ${String(e.message).slice(0, CLI_REASON_MAX)}`)
+    }
+    try {
+      const made = (await orca.worktrees()).find((w) => String(w.branch ?? '').replace(/^refs\/heads\//, '') === plan.branch)
+      if (made) remember(key, made.worktreeId, result.sessionId)
+    } catch {
+      // Orca no respondió la lista: el ticket se reconoce igual por la rama.
+    }
+    return { action: 'chat', surface: result.surface, detail: result.detail, branch: plan.branch }
   }
 
   // Solo lleva a una sesión o a un workspace que Orca acaba de listar: el id viene de la página.
@@ -920,6 +1002,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     if (url.pathname === '/api/pitwall') return reply(res, 200, await pitwallSnapshot())
     if (url.pathname === '/api/jira') return reply(res, 200, await jiraView())
     if (url.pathname === '/api/jira-start') return reply(res, 200, await jiraStartPlan(q.get('key'), q.get('repo')))
+    if (url.pathname === '/api/jira-targets') return reply(res, 200, { projects: await jiraTargetList().catch(() => { throw new ActionError('No pude leer los workspaces de Orca.') }) })
     if (url.pathname === '/api/repos') {
       if (q.get('fresh') === '1') expireSummaries()
       const items = []
@@ -959,6 +1042,9 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
       }
       return reply(res, 200, { ok: true })
     }
+    if (url.pathname === '/api/jira-chat') return reply(res, 200, await jiraChat(body))
+    if (url.pathname === '/api/jira-open') return reply(res, 200, await jiraOpen(body))
+    if (url.pathname === '/api/jira-new') return reply(res, 200, await jiraNewWorkspace(body))
     const item = repoOf(body.repo)
     if (url.pathname === '/api/run') {
       const { title, command } = await terminalCommand(item, body)

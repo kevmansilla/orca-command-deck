@@ -227,49 +227,10 @@ function watchJira(orca) {
   setInterval(tick, JIRA_POLL_MS)
 }
 
-const samePath = (a, b) => String(a ?? '').replace(/\/+$/, '') === String(b ?? '').replace(/\/+$/, '')
-
-// Los repos que Orca tiene como proyecto git: solo en esos se puede crear un workspace.
-async function gitProjects(orca) {
-  const { projects } = await orca.host.call('project.list')
-  return projects.filter((p) => p.kind === 'git' && !p.hidden)
-}
-
-// Arranca un ticket: un workspace nuevo de Orca en ese repo, con la rama del ticket sacada de origin/<base>, y el agente
-// con el primer mensaje. El plan lo arma el servidor (no se confía en lo que manda el panel) y no commitea ni pushea.
-async function startTicket(orca, { key, repo } = {}) {
-  if (typeof key !== 'string' || typeof repo !== 'string') throw Object.assign(new Error('Pedido inválido.'), { code: 'invalid_params' })
-  if (!orca.host.has('workspace.create')) throw new Error('Esta versión de Orca no deja crear workspaces desde un plugin.')
-  const { status, data: plan } = await relay({ path: `/api/jira-start?key=${encodeURIComponent(key)}&repo=${encodeURIComponent(repo)}` })
-  if (status !== 200) throw Object.assign(new Error(plan?.error ?? 'No pude preparar el ticket.'), { code: 'invalid_params' })
-  const project = (await gitProjects(orca)).find((p) => samePath(p.path, plan.path))
-  if (!project) throw Object.assign(new Error(`Orca no tiene ${plan.repo} como proyecto.`), { code: 'invalid_params' })
-  const created = await orca.host.call('workspace.create', {
-    projectId: project.id,
-    ...(project.hostId ? { hostId: project.hostId } : {}),
-    name: plan.branch,
-    baseBranch: plan.baseRef,
-    agent: plan.agent,
-    prompt: plan.prompt,
-    open: true
-  })
-  // Orca puede ajustar el nombre de la rama (prefijo, nombre repetido): se informa la que quedó.
-  let branch = plan.branch
-  try {
-    const { workspaces } = await orca.host.call('workspace.list')
-    branch = workspaces.find((w) => w.id === created.workspaceId)?.branch?.replace(/^refs\/heads\//, '') ?? branch
-  } catch (e) {
-    orca.log(`no pude leer la rama del workspace nuevo: ${e.message}`)
-  }
-  return { workspaceId: created.workspaceId, branch, expected: plan.branch }
-}
-
 export default function activate(orca) {
   const lastState = new Map()
   orca.panels.handle('api', (input) => relay(input))
   orca.panels.handle('open', (input) => openInOrca(orca, input))
-  orca.panels.handle('projects', async () => (await gitProjects(orca)).map((p) => p.path.replace(/\/+$/, '')))
-  orca.panels.handle('jiraStart', (input) => startTicket(orca, input))
   orca.commands.register('avisos.abrir', () => openLatestNotice(orca))
   orca.events.on('agent.status.changed', async (event) => {
     if (!shouldNotify(lastState, event)) return

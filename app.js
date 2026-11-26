@@ -777,7 +777,6 @@ var VIEWS = ['resumen', 'sesiones', 'avisos', 'jira', 'git']
 var JIRA_POLL_MS = 60000
 var JIRA_KNOWN_KEY = 'jiraConocidos'
 var JIRA_SEEN_KEY = 'jiraVisto'
-var JIRA_REQUEST_MS = 180000
 var JIRA_FOLDED_KEY = 'jiraPlegadas'
 // La bandeja que llena el worker (main.mjs) y hasta cuándo la leíste.
 var NOTICES_KEY = 'avisos'
@@ -1052,11 +1051,11 @@ function ticketItem(t, fresh, dim) {
   var color = fresh ? 'var(--c-waiting)' : s ? 'var(--c-working)' : stuck ? 'var(--c-blocked)' : 'var(--c-idle)'
   var chips = [chip(t.status || 'sin estado', stuck ? 'var(--c-blocked)' : JIRA_CATEGORY[t.category] || 'var(--muted)', 'Estado en Jira')]
   if (fresh) chips.push(chip('nuevo', 'var(--c-waiting)'))
-  if (s) chips.push('<button class="pchip c" style="--c:var(--c-working)" data-tsession="' + esc(t.key) + '" title="Ir a su sesión en Orca"><span class="pdot"></span>trabajando · ' + esc(s.name) + '</button>')
+  if (s) chips.push('<button class="pchip c" style="--c:var(--c-working)" data-tsession="' + esc(t.key) + '" title="' + esc(placesTitle(t.sessions)) + '"><span class="pdot"></span>' + esc(placesText(t.sessions)) + '</button>')
   chips.push(harnessChip(t.harness))
   if (t.pushed.length) chips.push(chip('rama pusheada', 'var(--add)', 'En origin (último fetch): ' + t.pushed.join(', ')))
   if (t.blocker) chips.push(chip('⛔ decisión de negocio', 'var(--c-blocked)', t.blocker))
-  if (!s && PANEL) chips.push('<button class="pchip" data-tstart="' + esc(t.key) + '" title="Workspace nuevo en Orca, con la rama del ticket">▶ Arrancar</button>')
+  chips.push('<button class="pchip" data-tstart="' + esc(t.key) + '" title="Abrir un chat de este ticket en un workspace de Orca">▶ Arrancar</button>')
   chips.push('<button class="pchip" data-tjira="' + esc(t.key) + '" title="Abrir en Jira">Jira ↗</button>')
   return '<div class="item ticket' + (fresh ? ' unread' : '') + (dim ? ' seen' : '') + '" style="--c:' + color + '" data-ticket="' + esc(t.key) + '" title="' + esc(t.title) + '">' +
     '<div class="top"><span class="tag">' + esc(t.key) + '</span><span class="ititle trunc">' + (t.blocker ? '⛔ ' : '') + esc(t.title) + '</span><span class="ago">' + ago(t.updated) + '</span></div>' +
@@ -1099,12 +1098,52 @@ function openExternal(url) {
   if (!/^https:\/\//.test(url || '')) return
   if (PANEL) { if (orca.shell) orca.shell.openExternal(url) } else window.open(url, '_blank', 'noopener')
 }
+function convos(p) {
+  return [p.chats ? plural(p.chats, 'chat', 'chats') : '', p.terminals ? plural(p.terminals, 'terminal', 'terminales') : ''].filter(Boolean).join(' + ') || 'sin conversaciones'
+}
+// «trabajando · main · 1 chat», «trabajando · 2 workspaces» si está en varios, o «workspace · X» sin conversaciones.
+function placesText(list) {
+  var busy = list.some(function (p) { return p.chats || p.terminals })
+  return (busy ? 'trabajando · ' : 'workspace · ') + (list.length > 1 ? list.length + ' workspaces' : list[0].name + (busy ? ' · ' + convos(list[0]) : ''))
+}
+function placesTitle(list) {
+  return list.map(function (p) { return p.name + ': ' + convos(p) + (p.remembered ? ' (arrancado desde acá)' : '') }).join('\n') +
+    '\nClic: abre el chat; si solo hay terminal, abre un chat nativo nuevo ahí.'
+}
 function openTicket(key, toJira) {
   var t = ticketOf(key)
   if (!t) return
-  var s = t.sessions[0]
-  if (s && !toJira) openInOrca(s.worktreeId, s.terminalId, s.path)
-  else openExternal(t.url)
+  if (toJira || !t.sessions.length) return openExternal(t.url)
+  if (t.sessions.length === 1) return openPlace(t, t.sessions[0])
+  placeMenu(t)
+}
+// El ticket está en un workspace: si tiene chat, Orca muestra ese workspace; si solo tiene terminal, abre un chat nuevo.
+function openPlace(t, p) {
+  send('/api/jira-open', { key: t.key, worktreeId: p.worktreeId }).then(function (r) {
+    if (r.action === 'chat') toast('Chat nuevo de ' + t.key + ' en ' + p.name + surfaceNote(r), !surfaceNote(r))
+    loadJira()
+  }).catch(function (e) { toast(e.message) })
+}
+// Varios workspaces: un menú corto para elegir, o arrancar en otro.
+function placeMenu(t) {
+  var box = document.getElementById('box')
+  box.textContent = ''
+  var options = el('div', 'list')
+  options.appendChild(el('div', 'opt-h', t.key + ' está en'))
+  t.sessions.forEach(function (p) {
+    var o = el('div', 'opt' + (p.chats ? ' busy' : ''))
+    o.appendChild(el('span', '', p.name + (p.remembered ? ' ★' : '')))
+    o.appendChild(el('span', 'meta', p.chats ? convos(p) : convos(p) + ' → chat nuevo'))
+    o.onclick = function () { closeModal(); openPlace(t, p) }
+    options.appendChild(o)
+  })
+  var other = el('div', 'opt new')
+  other.appendChild(el('span', '', '▶ Arrancar en otro workspace'))
+  other.appendChild(el('span', 'meta', ''))
+  other.onclick = function () { closeModal(); startPicker(t.key) }
+  options.appendChild(other)
+  box.appendChild(options)
+  document.getElementById('modal').style.display = 'flex'
 }
 function loadJira() {
   return api('/api/jira').then(function (j) { jira = j; jiraError = '' }, function (e) { jiraError = e.message }).then(function () {
@@ -1112,83 +1151,79 @@ function loadJira() {
     return orca.storage.get(JIRA_KNOWN_KEY).then(function (v) { jiraKnown = v && typeof v === 'object' ? v : {} })
   }).catch(function (e) { console.error('[command-deck] no pude leer Jira', e) }).then(renderBoard)
 }
-// Arrancar: elegís el repo (agrupados como en Orca), ves qué se va a crear y confirmás. Lo crea el worker.
+// Arrancar: elegís un workspace abierto (agrupados como en la barra lateral de Orca) y se abre ahí un chat nativo con
+// el primer mensaje, sin tocar git; o, al final de cada proyecto, un workspace nuevo con la rama del ticket.
 function startPicker(key) {
   var t = ticketOf(key)
   if (!t) return
-  orca.plugin.request('projects').then(function (paths) {
-    var roots = data.filter(function (r) { return !r.worktreeOf && paths.indexOf(r.key) >= 0 })
+  api('/api/jira-targets').then(function (j) {
     var box = document.getElementById('box')
     box.textContent = ''
     var input = el('input')
-    input.placeholder = 'Repo donde arrancar ' + key
+    input.placeholder = 'Workspace donde arrancar ' + key
     box.appendChild(input)
     var options = el('div', 'list')
     box.appendChild(options)
+    function option(text, meta, cls, fn) {
+      var o = el('div', 'opt' + (cls ? ' ' + cls : ''))
+      o.appendChild(el('span', '', text))
+      o.appendChild(el('span', 'meta', meta))
+      o.onclick = function () { closeModal(); fn() }
+      options.appendChild(o)
+    }
     function paint() {
       var term = input.value.trim().toLowerCase()
       options.textContent = ''
-      var last = null
-      roots.forEach(function (r) {
-        if (term && (r.name + ' ' + r.group).toLowerCase().indexOf(term) < 0) return
-        if (r.group !== last) { options.appendChild(el('div', 'opt-h', r.group || 'Sin grupo')); last = r.group }
-        var o = el('div', 'opt')
-        o.appendChild(el('span', '', r.name))
-        o.appendChild(el('span', 'meta', 'base ' + r.base))
-        o.onclick = function () { closeModal(); confirmStart(t, r) }
-        options.appendChild(o)
+      var lastGroup = null
+      j.projects.forEach(function (p) {
+        var hit = !term || (p.project + ' ' + p.group).toLowerCase().indexOf(term) >= 0
+        var spaces = p.workspaces.filter(function (w) { return hit || (w.name + ' ' + (w.branch || '')).toLowerCase().indexOf(term) >= 0 })
+        if (!hit && !spaces.length) return
+        if (p.group !== lastGroup) { options.appendChild(el('div', 'opt-h', p.group || 'Sin grupo')); lastGroup = p.group }
+        options.appendChild(el('div', 'opt-p', p.project))
+        spaces.forEach(function (w) {
+          var meta = [w.branch && w.branch !== w.name ? w.branch : '', w.agents ? plural(w.agents, 'agente', 'agentes') : ''].filter(Boolean).join(' · ')
+          option(w.name, meta, w.agents ? 'busy' : '', function () { startChat(t, w) })
+        })
+        option('＋ workspace nuevo ' + t.key + '-…', 'rama desde la base', 'new', function () { confirmNewWorkspace(t, p.repo) })
       })
-      if (!options.childNodes.length) options.appendChild(el('div', 'opt-h', 'Ningún repo coincide.'))
+      if (!options.childNodes.length) options.appendChild(el('div', 'opt-h', 'Ningún workspace coincide.'))
     }
     input.oninput = paint
     paint()
     document.getElementById('modal').style.display = 'flex'
     input.focus()
-  }).catch(function (e) { toast(e.message || 'No pude leer los proyectos de Orca.') })
+  }).catch(function (e) { toast(e.message || 'No pude leer los workspaces de Orca.') })
 }
-function confirmStart(t, r) {
-  api('/api/jira-start?key=' + encodeURIComponent(t.key) + '&repo=' + encodeURIComponent(r.key)).then(function (plan) {
+function surfaceNote(r) { return r.surface && r.surface !== 'chat' ? ' (Orca lo abrió en una terminal, no en el chat' + (r.detail ? ': ' + r.detail : '') + ')' : '' }
+function startChat(t, w) {
+  toast('Abriendo el chat de ' + t.key + ' en ' + w.name + '…', true)
+  send('/api/jira-chat', { key: t.key, worktreeId: w.worktreeId }).then(function (r) {
+    toast('Chat de ' + t.key + ' abierto en ' + w.name + surfaceNote(r), !surfaceNote(r))
+    loadJira()
+  }).catch(function (e) { toast(e.message) })
+}
+function confirmNewWorkspace(t, repo) {
+  api('/api/jira-start?key=' + encodeURIComponent(t.key) + '&repo=' + encodeURIComponent(repo)).then(function (plan) {
     var lines = [
       { text: 'Repo: ' + plan.repo + (plan.group ? ' (' + plan.group + ')' : '') },
       { text: 'Rama nueva: ' + plan.branch },
       { text: 'Sale de: ' + plan.baseRef + ', la base del repo, como quedó en el último fetch.' }
     ]
     if (plan.existing.length) lines.push({ warn: true, text: 'Ya hay ramas de este ticket en el repo: ' + plan.existing.join(', ') })
-    lines.push({ text: 'Abre un workspace nuevo en Orca y arranca ' + plan.agent + ' con: «' + plan.prompt + '»' })
-    dialog('Arrancar ' + t.key, lines, [], [
+    lines.push({ text: 'Crea un workspace nuevo en Orca y abre un chat de ' + plan.agent + ' con: «' + plan.prompt + '»' })
+    dialog('Workspace nuevo para ' + t.key, lines, [], [
       { label: 'Cancelar', safe: true },
-      { label: 'Crear workspace', kind: 'primary', run: function () { runStart(t.key, r.key) } }
+      { label: 'Crear workspace', kind: 'primary', run: function () { runNewWorkspace(t.key, repo) } }
     ])
   }).catch(function (e) { toast(e.message) })
 }
-function runStart(key, repo) {
+function runNewWorkspace(key, repo) {
   toast('Creando el workspace de ' + key + '…', true)
-  orca.plugin.request('jiraStart', { key: key, repo: repo }, { timeoutMs: JIRA_REQUEST_MS }).then(function (r) {
-    toast(r.branch === r.expected ? 'Workspace creado en ' + r.branch : 'Workspace creado, pero Orca le puso a la rama ' + r.branch + ' (esperaba ' + r.expected + ')', r.branch === r.expected)
+  send('/api/jira-new', { key: key, repo: repo }).then(function (r) {
+    toast('Workspace ' + r.branch + ' creado' + surfaceNote(r), !surfaceNote(r))
     loadJira()
-  }).catch(function (e) { toast(e.message || 'Orca no pudo crear el workspace.') })
-}
-function markNoticesRead() {
-  var last = notices.length ? notices[0].at : 0
-  if (last <= noticesRead) return
-  noticesRead = last
-  store(NOTICES_READ_KEY, noticesRead)
-}
-// La bandeja la escribe el worker: el panel la relee cada tanto y avisa con un cartel lo nuevo.
-function loadNotices() {
-  return Promise.all([orca.storage.get(NOTICES_KEY), orca.storage.get(NOTICES_READ_KEY)]).then(function (v) {
-    var list = Array.isArray(v[0]) ? v[0] : []
-    var read = Math.max(noticesRead, typeof v[1] === 'number' ? v[1] : 0)
-    var before = notices.length ? notices[0].id : null
-    var top = list.length ? list[0] : null
-    var changed = (top ? top.id : null) !== before || read !== noticesRead
-    var fresh = before !== null && top && top.id !== before && top.at > read
-    notices = list
-    noticesRead = read
-    if (view === 'avisos' && !document.hidden) markNoticesRead()
-    else if (fresh) toast('🔔 ' + top.title, true)
-    if (changed) renderBoard()
-  }).catch(function (e) { console.error('[command-deck] no pude leer los avisos', e) })
+  }).catch(function (e) { toast(e.message) })
 }
 function renderTabs(v) {
   var dirty = data.filter(FILTERS.cambios.test).length

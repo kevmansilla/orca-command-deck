@@ -123,7 +123,7 @@ Con `"jira"` en `policy.json` aparece la pestaña **Jira**: los tickets del proy
 - Cuando te asignan uno nuevo queda marcado «nuevo» hasta que mirás la pestaña, y llega a la pestaña Avisos (y al escritorio, si la campana está prendida), una vez por asignación.
 - «rama pusheada»: alguno de tus repos tiene `origin/ABC-12-*`, según su último fetch (no hace fetch).
 - `tickets` (opcional) es una carpeta con una subcarpeta por ticket (`ABC-12-algo/`). De ahí sale el estado del desarrollo (`- **Estado:**` de `US.md`, o su fila en `INDEX.md`): «listo para deploy», «deployado» (también si `deploy.md` dice `ejecutado`) o el estado que tenga. Una línea `⛔ Decisión de negocio: …` en `roadmap.md` o `US.md` marca el ticket con ⛔.
-- **Arrancar**, en un ticket sin workspace: elegís el repo, ves la rama nueva (`ABC-12-<título>`), de qué base sale (`origin/<base>`, con las mismas reglas de protección de arriba) y el primer mensaje, y al confirmar Orca crea el workspace y arranca el agente (`agent`, por defecto `claude`). No commitea ni pushea nada.
+- **Arrancar**, en un ticket sin workspace: elegís uno de los workspaces abiertos en Orca, agrupados como en su barra lateral (con cuántos agentes tiene cada uno), y se abre ahí un chat nativo de Orca con el primer mensaje, sin crear ramas ni tocar git. Al final de cada proyecto está «＋ workspace nuevo»: muestra la rama nueva (`ABC-12-<título>`), de qué base sale (`origin/<base>`, con las mismas reglas de protección de arriba) y el primer mensaje, y al confirmar Orca crea el workspace con el chat. Usa la CLI de Orca (`orca agent launch` y `orca worktree create`, con `--surface chat`), porque la API de plugins no deja elegir chat. El agente es `agent` (por defecto `claude`). No commitea ni pushea nada.
 
 ## Secretos
 

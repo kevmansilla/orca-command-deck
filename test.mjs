@@ -91,8 +91,8 @@ const orcaFalso = {
       { address: 'term_a1', state: 'done', stateStartedAt: 100, conversationName: '<local-command-caveat>x</local-command-caveat> Arreglar el login', lastAssistantMessage: '## Listo\n\n**Hecho** el `cambio`' },
       { address: 'term_b2', state: 'working', stateStartedAt: 200, taskTitle: 'Tests', toolName: 'Bash', toolInput: 'npm test' },
       { address: 'term_c3', state: 'working', interrupted: true, stateStartedAt: 50, prompt: 'cortada' },
-      { state: 'done', stateStartedAt: 10, conversationName: 'cerrada', orcaSessionId: 's-vieja' },
-      { state: 'waiting', stateStartedAt: 300, conversationName: 'chat', orcaSessionId: 's-chat' }
+      { address: 'orca_session_id:s-vieja', state: 'done', stateStartedAt: 10, conversationName: 'cerrada', orcaSessionId: 's-vieja' },
+      { address: 'orca_session_id:s-chat', state: 'waiting', stateStartedAt: 300, conversationName: 'chat', orcaSessionId: 's-chat' }
     ]
   }, {
     worktreeId: 'r1::/p/abc7', repo: 'app', displayName: 'app', path: '/p/abc7', branch: 'refs/heads/ABC-7-prueba', workspaceKind: 'git', lastActivityAt: 4, agents: []
@@ -102,8 +102,12 @@ const orcaFalso = {
   sessions: async () => new Set(['s-chat']),
   bots: () => [{ name: 'Asistente', path: '/bots/k' }, { name: 'Avisos', path: '/bots/n' }],
   focus: async (t) => { if (t === 'term_b2') throw new Error('stale'); enfocadas.push(t) },
-  activate: async (id) => activados.push(id)
+  activate: async (id) => activados.push(id),
+  launchChat: async (o) => { chats.push(o); return { surface: 'chat', sessionId: 'aaaaaaaa-0000-0000-0000-000000000001' } },
+  createWorkspaceChat: async (o) => { creados.push(o); return { surface: 'terminal', sessionId: null } }
 }
+const chats = []
+const creados = []
 // Un Jira inventado: cuenta las consultas y guarda lo que se le pidió.
 const adf = (...content) => ({ type: 'doc', version: 1, content })
 const parrafo = (text, bold = false) => ({ type: 'paragraph', content: [{ type: 'text', text, ...(bold ? { marks: [{ type: 'strong' }] } : {}) }] })
@@ -116,7 +120,8 @@ const jiraFalso = async (url, init) => {
     { key: 'ABC-7', fields: { summary: 'Prueba', updated: '2026-01-01T10:00:00.000-0300', status: { name: 'En curso', statusCategory: { key: 'indeterminate' } }, description: null } }
   ] }), { status: 200 })
 }
-const { port, token, close } = await startServer({ terminal: async (t) => opened.push(t), orca: orcaFalso, jiraFetch: jiraFalso })
+const arranques = join(tmp, 'arranques.json')
+const { port, token, close } = await startServer({ terminal: async (t) => opened.push(t), orca: orcaFalso, jiraFetch: jiraFalso, startsFile: arranques })
 const base = `http://127.0.0.1:${port}`
 let failures = 0
 
@@ -340,9 +345,23 @@ try {
   check('jira: la descripción breve se recorta', briefOf(adf(parrafo('x'.repeat(500)))).length === 220 && briefOf(null) === null)
   check('jira: el texto de listas y menciones también cuenta', adfLines(adf({ type: 'bulletList', content: [{ type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'mention', attrs: { text: '@Ana' } }, { type: 'text', text: ' revisa' }] }] }] })).map((l) => l.text).join() === '@Ana revisa')
   check('jira: la rama lleva la clave y el título sin tildes', branchFor('ABC-8', 'Revisar el envío de mails ¡ya!') === 'ABC-8-revisar-el-envio-de-mails-ya' && slugOf('a'.repeat(60)).length === 40)
-  const conRamas = [{ worktreeId: 'w1', branch: 'refs/heads/ABC-12-algo', agents: [{ address: 'term_1', state: 'working' }] }, { worktreeId: 'w2', branch: 'ABC-123-otro', agents: [] }, { worktreeId: 'w3', branch: 'ABC-12-bot', bot: 'x', agents: [] }]
-  const sesiones12 = sessionsOf('ABC-12', conRamas)
-  check('jira: el workspace se reconoce por la rama, sin confundir ABC-12 con ABC-123 ni contar bots', sesiones12.length === 1 && sesiones12[0].terminalId === 'term_1' && sesiones12[0].agentWorking)
+  const conRamas = [
+    { worktreeId: 'w1', branch: 'refs/heads/ABC-12-algo', agents: [{ address: 'term_1', state: 'working' }, { address: 'orca_session_id:c1', orcaSessionId: 'c1' }, { address: 'orca_session_id:c2', orcaSessionId: 'c2' }] },
+    { worktreeId: 'w2', branch: 'ABC-123-otro', agents: [] }, { worktreeId: 'w3', branch: 'ABC-12-bot', bot: 'x', agents: [] }, { worktreeId: 'w4', displayName: 'main', branch: 'main', agents: [] }
+  ]
+  const sesiones12 = sessionsOf('ABC-12', conRamas, new Set(['c1']))
+  check('jira: el workspace se reconoce por la rama, sin confundir ABC-12 con ABC-123 ni contar bots', sesiones12.length === 1 && sesiones12[0].terminals === 1 && sesiones12[0].chats === 1 && sesiones12[0].agentWorking)
+  const conRecuerdo = sessionsOf('ABC-12', conRamas, new Set(), [{ worktreeId: 'w4' }, { worktreeId: 'ya-no-esta' }])
+  check('jira: el workspace donde lo arrancaste va primero, aunque la rama no lleve la clave', conRecuerdo.map((p) => p.worktreeId + (p.remembered ? '*' : '')).join() === 'w4*,w1')
+  const { rememberStart } = await import('./jira.mjs')
+  const recuerdos = rememberStart(rememberStart(rememberStart({}, 'A-1', { worktreeId: 'x' }), 'A-1', { worktreeId: 'y' }), 'A-1', { worktreeId: 'x', sessionId: 's' })
+  check('jira: recuerda dónde arrancaste, lo último primero y sin repetir', recuerdos['A-1'].map((e) => e.worktreeId).join() === 'x,y' && recuerdos['A-1'][0].sessionId === 's')
+  const { cliError, outcomeOf, runningCli } = await import('./orca-tab.mjs')
+  check('orca: el motivo de una falla sale del JSON de la CLI o de su stderr', cliError('{"ok":false,"error":{"message":"no existe ese worktree"}}', '', 'x') === 'no existe ese worktree' && cliError('', 'algo\nOrca CLI is unavailable\n', 'x') === 'Orca CLI is unavailable' && cliError('', '', 'x') === 'x')
+  writeFileSync(join(tmp, 'runtime.json'), JSON.stringify({ pid: process.pid }))
+  check('orca: sin la CLI junto al ejecutable que corre, queda la del PATH', runningCli(join(tmp, 'runtime.json')) === null && runningCli(join(tmp, 'no-existe.json')) === null)
+  const salida = outcomeOf('{"result":{"outcome":{"kind":"structured","sessionId":"aaaaaaaa-0000-0000-0000-000000000001","handle":"structured-agent-session-aaaaaaaa-0000-0000-0000-000000000001"},"receipt":{"detail":"porque sí"}}}')
+  check('orca: lee si abrió chat o terminal, por qué y el id de la sesión', salida.surface === 'chat' && salida.sessionId === 'aaaaaaaa-0000-0000-0000-000000000001' && salida.detail === 'porque sí' && outcomeOf('{"result":{"launch":{"outcome":{"kind":"terminal"}}}}').surface === 'terminal' && outcomeOf('no').surface === null)
   check('jira: la traba abierta se lee de la línea ⛔ y la resuelta no cuenta', blockerIn('- ⛔ **Decisión de negocio:** el texto') === 'el texto' && blockerIn('✅ Decisión de negocio resuelta: listo') === null)
   const { jiraSections, visibleRows } = await import('./jira.mjs')
   const dia = 86_400_000
@@ -378,8 +397,35 @@ try {
   check('jira: la segunda consulta sale de la caché', jiraPedidos.length === 1)
   const [codigoPlan, plan] = await call('/api/jira-start?key=ABC-8&repo=app')
   check('/api/jira-start arma la rama desde origin/<base> y el primer mensaje', codigoPlan === 200 && plan.branch === 'ABC-8-revisar-el-envio-de-mails' && plan.baseRef === 'origin/master' && plan.existing.join() === 'origin/ABC-8-algo' && plan.prompt === 'Arrancamos ABC-8: Revisar el envío de mails (https://jira.example.test/browse/ABC-8)' && plan.agent === 'claude')
-  check('/api/jira-start no escribe git', !sh(repo, 'git', 'branch', '--list', 'ABC-8-*').trim())
+  check('/api/jira-start no escribe git ni crea nada', creados.length === 0 && !sh(repo, 'git', 'branch', '--list', 'ABC-8-*').trim())
   check('/api/jira-start rechaza un ticket que no es tuyo', (await call('/api/jira-start?key=ABC-99&repo=app'))[0] === 400 && (await call('/api/jira-start?key=x;rm&repo=app'))[0] === 400)
+  const { jiraTargets } = await import('./jira.mjs')
+  const reposT = [{ key: '/r/a', name: 'a', path: '/r/a', group: 'G1' }, { key: '/w/a-x', name: 'a-x', path: '/w/a-x', group: 'G1', worktreeOf: '/r/a' }, { key: '/r/b', name: 'b', path: '/r/b', group: 'G2' }]
+  const wtsT = [
+    { worktreeId: 'b::/r/b', repo: 'b', displayName: 'main', path: '/r/b', branch: 'refs/heads/main', workspaceKind: 'git', agents: [] },
+    { worktreeId: 'a::/w/a-x', repo: 'a', displayName: 'X', path: '/w/a-x/', branch: 'refs/heads/x', workspaceKind: 'git', agents: [{ address: 'term_1' }, { orcaSessionId: 'cerrada' }, { orcaSessionId: 'abierta' }] },
+    { worktreeId: 'a::/r/a', repo: 'a', displayName: 'Principal', path: '/r/a', branch: 'refs/heads/main', workspaceKind: 'git', agents: [] },
+    { worktreeId: 'bot', repo: 'a', path: '/r/a', bot: 'k', workspaceKind: 'git' },
+    { worktreeId: 'f:1', path: '/r/a', workspaceKind: 'folder-workspace' }
+  ]
+  const destinos = jiraTargets(wtsT, reposT, new Set(['abierta']))
+  check('jira: los workspaces para arrancar van agrupados por proyecto, en el orden de Orca, sin bots ni carpetas', destinos.map((p) => `${p.group}/${p.project}:${p.workspaces.map((w) => w.name + w.agents).join('+')}`).join() === 'G1/a:X2+Principal0,G2/b:main0')
+  const [codigoDest, dest] = await call('/api/jira-targets')
+  check('/api/jira-targets lista los workspaces abiertos con el repo para uno nuevo', codigoDest === 200 && dest.projects.length === 1 && dest.projects[0].repo === 'app' && dest.projects[0].workspaces[0].worktreeId === 'r1::/p/app' && dest.projects[0].workspaces[0].agents === 4)
+  const [codigoChat, chat] = await call('/api/jira-chat', { key: 'ABC-8', worktreeId: 'r1::/p/app' })
+  check('/api/jira-chat abre un chat nativo en ese workspace con el primer mensaje, sin tocar git', codigoChat === 200 && chat.surface === 'chat' && chat.action === 'chat' && chats.length === 1 && chats[0].worktreeId === 'r1::/p/app' && chats[0].agent === 'claude' && chats[0].prompt.startsWith('Arrancamos ABC-8: ') && !sh(repo, 'git', 'branch', '--list', 'ABC-8-*').trim())
+  check('/api/jira-chat rechaza un workspace que no está o un ticket ajeno', (await call('/api/jira-chat', { key: 'ABC-8', worktreeId: 'b1::/bots/k' }))[0] === 400 && (await call('/api/jira-chat', { key: 'ABC-99', worktreeId: 'r1::/p/app' }))[0] === 400 && chats.length === 1)
+  check('/api/jira-chat recuerda dónde lo arrancaste', JSON.parse(readFileSync(arranques, 'utf8'))['ABC-8'][0].sessionId === 'aaaaaaaa-0000-0000-0000-000000000001')
+  const recordado = (await call('/api/jira'))[1].issues.find((t) => t.key === 'ABC-8')
+  check('/api/jira muestra el workspace donde lo arrancaste, con sus chats', recordado.sessions.length === 1 && recordado.sessions[0].worktreeId === 'r1::/p/app' && recordado.sessions[0].remembered && recordado.sessions[0].chats === 1 && recordado.sessions[0].terminals === 3)
+  const activadosAntes = activados.length
+  const [codigoAbrir, abrir] = await call('/api/jira-open', { key: 'ABC-8', worktreeId: 'r1::/p/app' })
+  check('/api/jira-open con un chat abierto muestra ese workspace, sin abrir otro chat', codigoAbrir === 200 && abrir.action === 'opened' && activados.length === activadosAntes + 1 && chats.length === 1)
+  const [codigoSoloTerm, soloTerm] = await call('/api/jira-open', { key: 'ABC-7', worktreeId: 'r1::/p/abc7' })
+  check('/api/jira-open sin chat abre un chat nativo nuevo ahí', codigoSoloTerm === 200 && soloTerm.action === 'chat' && chats.length === 2 && chats[1].worktreeId === 'r1::/p/abc7')
+  check('/api/jira-open rechaza un workspace que no es del ticket', (await call('/api/jira-open', { key: 'ABC-7', worktreeId: 'b1::/bots/k' }))[0] === 400)
+  const [codigoNuevo, nuevo] = await call('/api/jira-new', { key: 'ABC-8', repo: 'app' })
+  check('/api/jira-new crea el workspace con la rama del ticket desde origin/<base>', codigoNuevo === 200 && nuevo.branch === 'ABC-8-revisar-el-envio-de-mails' && nuevo.surface === 'terminal' && creados.length === 1 && creados[0].baseRef === 'origin/master' && creados[0].path === repo && creados[0].branch === nuevo.branch)
   const caido = await startServer({ orca: orcaFalso, jiraFetch: async () => new Response('{}', { status: 401 }) })
   const rCaido = await fetch(`http://127.0.0.1:${caido.port}/api/jira`, { headers: { 'X-Token': caido.token } })
   const jCaido = await rCaido.json()

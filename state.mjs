@@ -8,6 +8,8 @@ const DIR = join(process.env.XDG_CACHE_HOME ?? join(homedir(), '.cache'), 'orca-
 const CODE = ['server.mjs', 'pitwall.mjs', 'jira.mjs', 'daemon.mjs', 'state.mjs', 'index.html', 'app.js', 'app.css', 'orca-tab.mjs'].map((f) => fileURLToPath(new URL(`./${f}`, import.meta.url)))
 
 export const statePath = () => join(DIR, 'server.json')
+// Otros archivos propios del servidor en la misma carpeta (no secretos).
+export const cachePath = (name) => join(DIR, name)
 
 // Cambia cuando cambia el código, para no reutilizar un servidor viejo después de actualizar el plugin.
 export const serverStamp = () => CODE.map((f) => statSync(f).mtimeMs).join('-')

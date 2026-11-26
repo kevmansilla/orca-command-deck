@@ -21,6 +21,7 @@ const SITE_RE = /^https:\/\/[a-z0-9.-]+(:\d+)?$/i
 const BLOCKER_RE = /^\s*(?:[-*]\s*)?⛔\s*\**\s*Decisi[oó]n de negocio\s*\**\s*:\s*\**\s*(.+?)\s*$/m
 export const BLOCKER_FILES = ['roadmap.md', 'US.md']
 const SLUG_MAX = 40
+const REMEMBER_MAX = 5
 
 // La configuración de `jira` en policy.json, validada. Sin ella (o inválida), no hay pestaña Jira.
 export function jiraConfig(raw, expand = (p) => p) {
@@ -122,21 +123,38 @@ export function briefOf(description, max = BRIEF_MAX) {
 
 const keyRe = (key) => new RegExp(`(?:^|[^A-Z0-9])${key}(?![0-9])`, 'i')
 
-// Los workspaces de Orca cuya rama o nombre llevan la clave del ticket: ahí lo estás trabajando.
-export function sessionsOf(key, worktrees) {
+const CHAT_PREFIX = 'orca_session_id:'
+
+// Dónde está el ticket en Orca: primero los workspaces donde lo arrancaste desde el panel (`remembered`, lo más nuevo
+// primero), después los que llevan la clave en la rama o el nombre. Por cada uno, cuántos chats nativos y cuántas
+// terminales de agente tiene abiertos (`open`: sesiones que Orca lista como abiertas).
+export function sessionsOf(key, worktrees, open = new Set(), remembered = []) {
   const re = keyRe(key)
-  return worktrees.filter((w) => !w.isArchived && !w.bot && (re.test(String(w.branch ?? '').replace(/^refs\/heads\//, '')) || re.test(String(w.displayName ?? ''))))
-    .map((w) => {
-      const agents = (w.agents ?? []).filter((a) => isTerminal(a.address))
-      const pick = agents.find((a) => a.state === 'working') ?? agents[0]
-      return {
-        worktreeId: w.worktreeId,
-        path: w.path ?? null,
-        name: w.displayName || String(w.branch ?? '').replace(/^refs\/heads\//, '') || key,
-        terminalId: pick?.address ?? null,
-        agentWorking: agents.some((a) => a.state === 'working' && !a.interrupted)
-      }
-    })
+  const live = worktrees.filter((w) => !w.isArchived && !w.bot)
+  const byId = new Map(live.map((w) => [w.worktreeId, w]))
+  const named = live.filter((w) => re.test(String(w.branch ?? '').replace(/^refs\/heads\//, '')) || re.test(String(w.displayName ?? '')))
+  const ids = [...new Set([...remembered.map((r) => r.worktreeId), ...named.map((w) => w.worktreeId)])].filter((id) => byId.has(id))
+  return ids.map((id) => {
+    const w = byId.get(id)
+    const agents = w.agents ?? []
+    const chats = agents.filter((a) => String(a.address ?? '').startsWith(CHAT_PREFIX) && open.has(a.orcaSessionId))
+    const terminals = agents.filter((a) => isTerminal(a.address))
+    return {
+      worktreeId: id,
+      path: w.path ?? null,
+      name: w.displayName || String(w.branch ?? '').replace(/^refs\/heads\//, '') || key,
+      remembered: remembered.some((r) => r.worktreeId === id),
+      chats: chats.length,
+      terminals: terminals.length,
+      agentWorking: chats.concat(terminals).some((a) => a.state === 'working' && !a.interrupted)
+    }
+  })
+}
+
+// Recuerda dónde arrancaste un ticket: el más nuevo primero, sin repetir el workspace, con tope.
+export function rememberStart(map, key, entry, max = REMEMBER_MAX) {
+  const list = (Array.isArray(map?.[key]) ? map[key] : []).filter((e) => e.worktreeId !== entry.worktreeId)
+  return { ...(map ?? {}), [key]: [entry, ...list].slice(0, max) }
 }
 
 // La traba de negocio abierta en un archivo del ticket, o null.
@@ -169,10 +187,10 @@ export const fillPrompt = (template, values) => String(template).replace(/\{(key
 
 // Las filas que ve el panel: con sesión en Orca primero, después lo más reciente.
 // `extra(key)` suma lo que sale del disco: la traba de negocio, el estado del harness y dónde está pusheada.
-export function jiraRows(issues, { site, worktrees = [], extra = () => ({}) }) {
+export function jiraRows(issues, { site, worktrees = [], open = new Set(), remembered = {}, extra = () => ({}) }) {
   const rows = issues.map((it) => {
     const f = it.fields ?? {}
-    const sessions = sessionsOf(it.key, worktrees)
+    const sessions = sessionsOf(it.key, worktrees, open, remembered[it.key] ?? [])
     return {
       key: it.key,
       title: f.summary ?? it.key,
@@ -189,6 +207,28 @@ export function jiraRows(issues, { site, worktrees = [], extra = () => ({}) }) {
     }
   })
   return rows.sort((a, b) => (b.sessions.length > 0) - (a.sessions.length > 0) || (b.updated ?? 0) - (a.updated ?? 0))
+}
+
+// Dónde arrancar un ticket: los workspaces git que Orca tiene abiertos, agrupados por proyecto en el orden de la barra
+// lateral (`repos` es la lista del Source Control, con sus worktrees). `agents` cuenta las sesiones abiertas.
+export function jiraTargets(worktrees, repos, open = new Set()) {
+  const byPath = new Map(repos.map((r) => [r.path, r]))
+  const projects = new Map()
+  for (const w of worktrees) {
+    if (w.isArchived || w.bot || w.workspaceKind !== 'git') continue
+    const item = byPath.get(String(w.path ?? '').replace(/\/+$/, ''))
+    const root = item && repos.find((r) => r.key === (item.worktreeOf ?? item.key))
+    if (!root) continue
+    if (!projects.has(root.key)) projects.set(root.key, { repo: root.key, project: w.repo || root.name, group: root.group ?? '', workspaces: [] })
+    const branch = String(w.branch ?? '').replace(/^refs\/heads\//, '') || null
+    projects.get(root.key).workspaces.push({
+      worktreeId: w.worktreeId,
+      name: w.displayName || branch || root.name,
+      branch,
+      agents: (w.agents ?? []).filter((a) => isTerminal(a.address) || open.has(a.orcaSessionId)).length
+    })
+  }
+  return repos.filter((r) => projects.has(r.key)).map((r) => projects.get(r.key))
 }
 
 // Los tickets que aparecieron desde la vuelta anterior. `known` es { clave: cuándo se vio por primera vez }; en la
