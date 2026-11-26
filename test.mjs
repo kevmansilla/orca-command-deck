@@ -12,6 +12,10 @@ sh(tmp, 'git', 'init', '-q', '--bare', '-b', 'master', 'remote.git')
 sh(tmp, 'git', 'clone', '-q', 'remote.git', 'app')
 sh(repo, 'git', 'config', 'user.email', 'test@example.com')
 sh(repo, 'git', 'config', 'user.name', 'test')
+// El comando de worktrees de la policy es `git wt`: un alias de este repo a un script que existe, para no depender de la
+// configuración de git de la máquina.
+writeFileSync(join(tmp, 'wt.sh'), 'exit 0\n')
+sh(repo, 'git', 'config', 'alias.wt', `!bash ${join(tmp, 'wt.sh')}`)
 // El ignore global de cada máquina puede esconder los .env y volver inútiles las pruebas de secretos.
 sh(repo, 'git', 'config', 'core.excludesFile', '/dev/null')
 sh(repo, 'git', 'switch', '-q', '-c', 'master')
@@ -79,6 +83,7 @@ writeFileSync(join(tmp, 'policy.json'), JSON.stringify({
 }))
 process.env.MRG_REPOS_FILE = join(tmp, 'repos.json')
 process.env.MRG_POLICY_FILE = join(tmp, 'policy.json')
+process.env.MRG_ORCA_WORKSPACES = join(tmp, 'orca-ws')
 
 const { fillCommand, prUrl, shellQuote, startServer } = await import('./server.mjs')
 const opened = []
@@ -285,6 +290,24 @@ try {
   const suelto = (await call('/api/repos?fresh=1'))[1].find((r) => r.key === join(tmp, 'wt-suelto'))
   check('borra un worktree detached por la ruta', (await call('/api/run', { repo: suelto.key, command: 'wt-remove' }))[0] === 200 && opened.at(-1).command === `git -C ${shellQuote(repo)} worktree remove ${shellQuote(suelto.key)}`)
   check('con force confirmado, lo borra aunque tenga cambios', (await call('/api/run', { repo: suelto.key, command: 'wt-remove', force: true }))[0] === 200 && opened.at(-1).command === `git -C ${shellQuote(repo)} worktree remove --force ${shellQuote(suelto.key)}`)
+  const antesOrca = opened.length
+  sh(repo, 'git', 'worktree', 'add', '-q', '-b', 'rama-orca', join(tmp, 'orca-ws', 'app-orca'), 'HEAD')
+  const conOrca = (await call('/api/repos?fresh=1'))[1]
+  const deOrca = conOrca.find((r) => r.key === join(tmp, 'orca-ws', 'app-orca'))
+  check('reconoce el worktree que es un workspace de Orca (y el de afuera no)', deOrca?.orcaWorkspace === true && conOrca.find((r) => r.key === join(tmp, 'wt-real')).orcaWorkspace === false && conOrca.find((r) => r.key === 'app').orcaWorkspace === false)
+  const [codigoOrca, borrarOrca] = await call('/api/run', { repo: deOrca.key, command: 'wt-remove' })
+  check('no borra por git un workspace de Orca (se llevaría su conversación)', codigoOrca === 400 && /workspace de Orca/.test(borrarOrca.error) && opened.length === antesOrca && existsSync(join(tmp, 'orca-ws', 'app-orca')))
+  const { isOrcaWorkspace, commandProblem } = await import('./server.mjs')
+  check('un workspace que Orca lista cuenta aunque esté fuera de su carpeta', isOrcaWorkspace('/x/y/', '/w', new Set(['/x/y'])) && !isOrcaWorkspace('/w2/a', '/w') && isOrcaWorkspace('/w/a', '/w') && !isOrcaWorkspace('/w', '/w'))
+  sh(repo, 'git', 'config', 'alias.wt', `!bash ${join(tmp, 'no-existe.sh')}`)
+  const sinScript = (await call('/api/repos?fresh=1'))[1]
+  const wtSin = sinScript.find((r) => r.key === join(tmp, 'wt-real'))
+  check('si el script del alias no existe, no ofrece crear ni borrar worktrees y dice por qué', wtSin.canRemoveWorktree === false && sinScript.find((r) => r.key === 'app').canCreateWorktree === false && /git wt: falta .*no-existe\.sh/.test(wtSin.worktreeProblem))
+  const [codigoSin, borrarSin] = await call('/api/run', { repo: wtSin.key, command: 'wt-remove' })
+  check('y el borrado con rama avisa en vez de abrir una terminal que falla', codigoSin === 400 && /no anda en esta máquina/.test(borrarSin.error) && opened.length === antesOrca)
+  check('detached se puede borrar igual: va por git worktree remove', (await call('/api/run', { repo: suelto.key, command: 'wt-remove' }))[0] === 200 && opened.length === antesOrca + 1)
+  check('un comando que no es git se busca en el PATH', (await commandProblem('no-existe-cmd-xyz {repo}', repo)) === 'no está no-existe-cmd-xyz' && (await commandProblem('git worktree add {path}', repo)) === null)
+  sh(repo, 'git', 'config', 'alias.wt', `!bash ${join(tmp, 'wt.sh')}`)
   check('force que no es true no fuerza', (await call('/api/run', { repo: suelto.key, command: 'wt-remove', force: 'true' }))[0] === 200 && !opened.at(-1).command.includes('--force'))
   check('el nombre del botón usa la base del repo', withWt.find((r) => r.key === 'libre').commands.some((c) => c.label === 'A master'))
   check('no ofrece el comando de rama parado en una protegida', !withWt[0].commands.some((c) => c.label === 'A master'))
@@ -404,6 +427,11 @@ try {
   const sinRoadmap = join(tmp, 'sin-roadmap')
   mkdirSync(sinRoadmap)
   check('jira: sin roadmap.md no se crea nada', appendTrail(sinRoadmap, '- x') === false && !existsSync(join(sinRoadmap, 'roadmap.md')))
+  const { harnessStateFor, withUsState, withIndexState, jiraConfig: cfgJ } = await import('./jira.mjs')
+  check('jira: Testing e In Progress tienen estado del harness por defecto; Done y Bloqueados no', harnessStateFor(cfgJ({ site: 'https://x.test', project: 'ABC', credentials: 'c' }).harnessStates, 'testing') === 'listo-para-probar' && harnessStateFor(undefined, 'Testing') === null && harnessStateFor({ Testing: 'listo-para-probar' }, 'Done') === null)
+  check('jira: el mapa de policy.json se valida (estados del harness que no existen se descartan)', JSON.stringify(cfgJ({ site: 'https://x.test', project: 'ABC', credentials: 'c', harnessStates: { Done: 'desplegado', Raro: 'inventado' } }).harnessStates) === '{"Done":"desplegado"}')
+  check('jira: el estado de US.md cambia en la viñeta o en línea, sin pisar texto libre', withUsState('# A\n- **Estado:** `en-review` — falta X\n', 'listo-para-probar') === '# A\n- **Estado:** `listo-para-probar` — falta X\n' && withUsState('**Etiqueta:** x · **Estado:** nuevo ·', 'en-progreso') === '**Etiqueta:** x · **Estado:** en-progreso ·' && withUsState('- **Estado:** en curso', 'en-progreso') === null && withUsState('# sin estado', 'en-progreso') === null && withUsState('- **Estado:** en-progreso', 'en-progreso') === null)
+  check('jira: el estado de INDEX.md cambia solo en la fila del ticket', withIndexState('| A-1 | `x` | `en-review` | a |\n| A-10 | `en-review` |', 'A-1', 'listo-para-probar') === '| A-1 | `x` | `listo-para-probar` | a |\n| A-10 | `en-review` |' && withIndexState('| A-2 | `nuevo` |', 'A-1', 'en-progreso') === null)
   writeFileSync(join(sinRoadmap, 'roadmap.md'), '# R\n- a')
   appendTrail(sinRoadmap, '- b')
   check('jira: el rastro va en su propio renglón aunque el archivo no termine en salto', readFileSync(join(sinRoadmap, 'roadmap.md'), 'utf8') === '# R\n- a\n- b\n')
@@ -476,9 +504,11 @@ try {
   const roadmap8 = join(tickets, 'ABC-8-mails/roadmap.md')
   const us8 = readFileSync(join(tickets, 'ABC-8-mails/US.md'), 'utf8')
   check('/api/jira-transition deja el rastro al final del roadmap.md del ticket', ok.trail === 'ok' && ok.from === 'To Do' && /\n- \d{4}-\d{2}-\d{2} \d{2}:\d{2} Jira: To Do → Testing \(desde Command Deck\)\n$/.test(readFileSync(roadmap8, 'utf8')) && readFileSync(roadmap8, 'utf8').startsWith('# Roadmap\n\n- ⛔'))
-  check('/api/jira-transition no toca US.md ni INDEX.md', readFileSync(join(tickets, 'ABC-8-mails/US.md'), 'utf8') === us8 && !readFileSync(join(tickets, 'INDEX.md'), 'utf8').includes('Testing'))
+  check('/api/jira-transition a Testing pasa el US.md a listo-para-probar, sin tocar el resto', ok.stateWrite === 'ok' && ok.harnessState === 'listo-para-probar' && readFileSync(join(tickets, 'ABC-8-mails/US.md'), 'utf8') === us8.replace('listo-para-deploy', 'listo-para-probar'))
+  const index0 = readFileSync(join(tickets, 'INDEX.md'), 'utf8')
   const [codigo7, mov7] = await call('/api/jira-transition', { key: 'ABC-7', id: '31' })
   check('/api/jira-transition sin roadmap.md no crea nada', codigo7 === 200 && mov7.trail === 'none' && !existsSync(join(tickets, 'ABC-7-prueba/roadmap.md')))
+  check('/api/jira-transition cambia la fila de INDEX.md y no pisa un estado de US.md que no es de los fijos', mov7.stateWrite === 'ok' && readFileSync(join(tickets, 'INDEX.md'), 'utf8') === index0.replace('`en-progreso`', '`listo-para-probar`') && readFileSync(join(tickets, 'ABC-7-prueba/US.md'), 'utf8').includes('en curso'))
   chmodSync(roadmap8, 0o444)
   const [codigoRo, ro] = await call('/api/jira-transition', { key: 'ABC-8', id: '31' })
   chmodSync(roadmap8, 0o644)
@@ -496,6 +526,15 @@ try {
   const jCaido = await rCaido.json()
   caido.close()
   check('jira: si Jira rechaza, el panel recibe el error sin el token y sin romperse', rCaido.status === 200 && jCaido.enabled && jCaido.issues.length === 0 && /401/.test(jCaido.error) && !JSON.stringify(jCaido).includes('token-de-prueba'))
+  // El panel corre app.js entero de una: una función que se llama y no existe corta todo lo que viene después (pasó
+  // con loadNotices: la pestaña Git quedaba vacía). Cada llamada a un nombre suelto tiene que estar declarada.
+  const appSrc = readFileSync(new URL('./app.js', import.meta.url), 'utf8').replace(/\/\/.*$/gm, '').replace(/'(?:[^'\\\n]|\\.)*'/g, "''").replace(/\/(?![*/])(?:[^/\\\n]|\\.)+\/[gimsuy]*/g, '0')
+  const declaradas = new Set()
+  for (const m of appSrc.matchAll(/\bfunction\s*(\w*)\s*\(([^)]*)\)/g)) [m[1], ...m[2].split(',')].map((x) => x.trim()).filter(Boolean).forEach((x) => declaradas.add(x))
+  for (const m of appSrc.matchAll(/\bvar\s+([^;=]+)/g)) m[1].split(',').forEach((x) => declaradas.add(x.trim().split(/\s/)[0]))
+  const NATIVAS = ['if', 'for', 'while', 'switch', 'function', 'return', 'catch', 'typeof', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'Number', 'String', 'Boolean', 'parseInt', 'parseFloat', 'isNaN', 'encodeURIComponent', 'decodeURIComponent', 'Date', 'Error', 'RegExp', 'Array', 'Object', 'Promise', 'ResizeObserver', 'fetch', 'requestAnimationFrame', 'Set', 'Map', 'KeyboardEvent', 'URLSearchParams', 'matchMedia']
+  const sueltas = [...new Set([...appSrc.matchAll(/(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(/g)].map((m) => m[1]))].filter((x) => !declaradas.has(x) && !NATIVAS.includes(x))
+  check(`app.js: toda función que se llama está declarada${sueltas.length ? ` (faltan: ${sueltas.join(', ')})` : ''}`, sueltas.length === 0)
 } finally {
   close()
 }

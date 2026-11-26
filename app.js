@@ -439,12 +439,17 @@ function runInTerminal(r, command, extra) {
     return send('/api/run', Object.assign({ repo: r.key, command: command }, extra || {})).catch(function (e) { toast(e.message) })
   })
 }
+// Un merge desde el worktree de un ticket termina ofreciendo borrar el worktree; si es un workspace de Orca, eso se lleva
+// la conversación. El aviso va antes de abrir la terminal.
+var ORCA_WORKSPACE_WARN = 'Es un workspace de Orca: si al final te ofrece borrar el worktree, respondé que no. Borrarlo se lleva la conversación de Orca; cerralo o archivalo desde Orca.'
 function commandClick(r, c) {
-  if (!c.warn || !r.deploys) return runInTerminal(r, c.id)
-  dialog(c.label, [
-    { warn: true, text: 'En este repo, lo que llega a ' + r.base + ' por push se despliega.' },
-    { text: 'Se abre una terminal con tu comando. Antes del push te va a pedir confirmación ahí.' }
-  ], [fileItem(c.run)], [
+  var orcaWs = c.warn && r.orcaWorkspace
+  if (!c.warn || (!r.deploys && !orcaWs)) return runInTerminal(r, c.id)
+  var lines = []
+  if (orcaWs) lines.push({ warn: true, text: ORCA_WORKSPACE_WARN })
+  if (r.deploys) lines.push({ warn: true, text: 'En este repo, lo que llega a ' + r.base + ' por push se despliega.' })
+  lines.push({ text: 'Se abre una terminal con tu comando.' + (r.deploys ? ' Antes del push te va a pedir confirmación ahí.' : '') })
+  dialog(c.label, lines, [fileItem(c.run)], [
     { label: 'Cancelar', safe: true },
     { label: 'Abrir terminal', kind: 'primary', run: function () { runInTerminal(r, c.id) } }
   ])
@@ -468,6 +473,13 @@ function newWorktreeDialog(r) {
 }
 function removeWorktreeDialog(r) {
   var dirty = r.staged.length + r.changes.length
+  // Un workspace de Orca no se borra desde acá: Orca sacaría el workspace y, con él, su conversación.
+  if (r.orcaWorkspace) {
+    return dialog('Es un workspace de Orca', [
+      { warn: true, text: 'Este worktree es un workspace de Orca, con su conversación. Borrarlo por git hace que Orca lo saque y se pierda el chat.' },
+      { text: 'Cerralo o archivalo desde Orca (la barra lateral de workspaces). La rama queda igual.' }
+    ], [fileItem(r.name)], [{ label: 'Entendido', safe: true }])
+  }
   if (!r.detached) {
     return dialog('Borrar worktree', [{ text: 'Se abre una terminal con tu comando. Si hay cambios sin commitear, se frena ahí.' }], [fileItem(r.branch)], [
       { label: 'Cancelar', safe: true },
@@ -482,6 +494,12 @@ function removeWorktreeDialog(r) {
     { label: dirty ? 'Borrar con los cambios' : 'Borrar', kind: 'danger', run: function () { runInTerminal(r, 'wt-remove', dirty ? { force: true } : null) } }
   ])
 }
+// El botón de borrar: en un worktree con el comando configurado andando; detached también si el comando no está, porque
+// va por git worktree remove; y en un workspace de Orca, para explicar por qué no. Sin comando que ande, no aparece.
+function canRemove(r) {
+  if (!r.worktreeOf) return false
+  return r.orcaWorkspace || r.canRemoveWorktree || (r.detached && !!r.worktreeProblem)
+}
 function moreActions(r, wrap) {
   var row = el('div', 'more')
   function add(label, hint, fn, cls) {
@@ -494,7 +512,7 @@ function moreActions(r, wrap) {
   r.commands.filter(function (c) { return c.urgent }).forEach(function (c) { add(c.label, c.hint, function () { commandClick(r, c) }, ' on') })
   r.commands.filter(function (c) { return !c.urgent }).forEach(function (c) { add(c.label, c.hint, function () { commandClick(r, c) }) })
   if (r.canCreateWorktree && !r.worktreeOf) add('Nuevo worktree', 'Otra carpeta del repo, en su propia rama', function () { newWorktreeDialog(r) })
-  if (r.canRemoveWorktree && r.worktreeOf) add('Borrar worktree', 'Borra la carpeta; la rama queda', function () { removeWorktreeDialog(r) })
+  if (canRemove(r)) add('Borrar worktree', r.orcaWorkspace ? 'Es un workspace de Orca: se cierra desde Orca' : 'Borra la carpeta; la rama queda', function () { removeWorktreeDialog(r) })
   if (row.firstChild) wrap.appendChild(row)
 }
 function discardDialog(r, f) {
@@ -630,7 +648,7 @@ function repoView(r) {
   tools.appendChild(iconBtn('fetch', 'Fetch', function () { act(r.key, 'fetch', null, 'Fetch listo') }))
   if (r.upstream) tools.appendChild(iconBtn('pull', 'Pull (solo fast-forward)', function () { act(r.key, 'pull', null, 'Pull listo') }))
   if (!r.protected) tools.appendChild(iconBtn('push', 'Push de esta rama', function () { pushDialog(r) }))
-  if (r.canRemoveWorktree && r.worktreeOf) tools.appendChild(iconBtn('trash', 'Borrar worktree', function () { removeWorktreeDialog(r) }))
+  if (canRemove(r)) tools.appendChild(iconBtn('trash', r.orcaWorkspace ? 'Workspace de Orca: se cierra desde Orca' : 'Borrar worktree', function () { removeWorktreeDialog(r) }))
   h.appendChild(tools)
   if (busy[r.key]) {
     var doing = el('span', 'doing')
@@ -1150,7 +1168,8 @@ function applyStatus(t, tr) {
   send('/api/jira-transition', { key: t.key, id: tr.id }).then(function (r) {
     delete jiraMoves[t.key]
     if (r.trail === 'error') jiraMoves[t.key] = { warn: 'Cambió en Jira a ' + r.status + ', pero no quedó el rastro en roadmap.md (' + (r.trailError || 'error') + ').' }
-    toast(t.key + ' → ' + r.status + (r.trail === 'ok' ? ' · anotado en roadmap.md' : ''), true)
+    else if (r.stateWrite === 'error') jiraMoves[t.key] = { warn: 'Cambió en Jira a ' + r.status + ', pero no se pudo cambiar el estado en el harness (' + (r.stateError || 'error') + ').' }
+    toast(t.key + ' → ' + r.status + (r.trail === 'ok' ? ' · anotado en roadmap.md' : '') + (r.stateWrite === 'ok' ? ' · harness: ' + r.harnessState : ''), true)
     return loadJira()
   }, function (e) {
     jiraMoves[t.key] = { error: e.message }
@@ -1354,6 +1373,28 @@ function runNewWorkspace(key, repo) {
     toast('Workspace ' + r.branch + ' creado' + surfaceNote(r), !surfaceNote(r))
     loadJira()
   }).catch(function (e) { toast(e.message) })
+}
+function markNoticesRead() {
+  var last = notices.length ? notices[0].at : 0
+  if (last <= noticesRead) return
+  noticesRead = last
+  store(NOTICES_READ_KEY, noticesRead)
+}
+// La bandeja la escribe el worker: el panel la relee cada tanto y avisa con un cartel lo nuevo.
+function loadNotices() {
+  return Promise.all([orca.storage.get(NOTICES_KEY), orca.storage.get(NOTICES_READ_KEY)]).then(function (v) {
+    var list = Array.isArray(v[0]) ? v[0] : []
+    var read = Math.max(noticesRead, typeof v[1] === 'number' ? v[1] : 0)
+    var before = notices.length ? notices[0].id : null
+    var top = list.length ? list[0] : null
+    var changed = (top ? top.id : null) !== before || read !== noticesRead
+    var fresh = before !== null && top && top.id !== before && top.at > read
+    notices = list
+    noticesRead = read
+    if (view === 'avisos' && !document.hidden) markNoticesRead()
+    else if (fresh) toast('🔔 ' + top.title, true)
+    if (changed) renderBoard()
+  }).catch(function (e) { console.error('[command-deck] no pude leer los avisos', e) })
 }
 function renderTabs(v) {
   var dirty = data.filter(FILTERS.cambios.test).length

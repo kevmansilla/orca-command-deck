@@ -31,6 +31,11 @@ export const DONE_MAX = 50
 const DONE_CATEGORY = 'done'
 // Sin la lista de estados de Jira, el terminado se reconoce por este nombre.
 const DONE_FALLBACK = 'Done'
+// Los estados fijos del harness (flujos/tickets.md §3.2).
+export const HARNESS_STATES = ['nuevo', 'planificado', 'en-progreso', 'en-review', 'en-correccion', 'listo-para-probar', 'listo-para-deploy', 'desplegado', 'bloqueado', 'descartado']
+// Qué estado del harness toma el ticket cuando se lo mueve en Jira desde el panel. Solo los que no dejan dudas: «Done» no
+// dice si se desplegó y verificó, y «Bloqueados» pide anotar el porqué. Se cambia con `jira.harnessStates` en policy.json.
+export const DEFAULT_HARNESS_STATES = { 'In Progress': 'en-progreso', Testing: 'listo-para-probar' }
 // Las marcas que leen los scripts del harness en roadmap.md (⛔ ✅ 🚧 ↪): un nombre de estado no puede imitarlas.
 const HARNESS_MARKS_RE = /[\u26D4\u2705\u{1F6A7}\u21AA]/gu
 
@@ -53,9 +58,50 @@ export function jiraConfig(raw, expand = (p) => p) {
     hideStatuses: names(raw.hideStatuses) ?? ['Testing'],
     // Estados que van en su propia sección, después de «En curso» y en este orden. Sin lista, los de categoría «new».
     sections: names(raw.sections),
+    // Estado de Jira → estado del harness al moverlo desde el panel ({} para no tocar el estado del harness).
+    harnessStates: statesFrom(raw.harnessStates) ?? DEFAULT_HARNESS_STATES,
     // Lo que no se actualiza hace más de esto va al final de su sección, plegado.
     staleDays: Number.isFinite(raw.staleDays) && raw.staleDays > 0 ? raw.staleDays : STALE_DAYS
   }
+}
+
+// Un mapa { "estado de Jira": "estado del harness" }, solo con estados del harness válidos. null si no es un objeto.
+function statesFrom(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null
+  return Object.fromEntries(Object.entries(v).filter(([k, x]) => k.trim() && HARNESS_STATES.includes(x)).map(([k, x]) => [k.trim(), x]))
+}
+
+// El estado del harness que corresponde a un estado de Jira, sin distinguir mayúsculas. null si no hay.
+export function harnessStateFor(map, status) {
+  const hit = Object.entries(map ?? {}).find(([k]) => k.toLowerCase() === String(status ?? '').toLowerCase())
+  return hit ? hit[1] : null
+}
+
+const US_BULLET_RE = /^(- \*\*Estado:\*\*\s*`?)([a-z][a-z-]*[a-z])/m
+const US_INLINE_RE = /(\*\*Estado:\*\*\s*`?)([a-z][a-z-]*[a-z])/
+
+// US.md con el estado cambiado: la viñeta «- **Estado:** x» o, si no hay, el campo en línea. Solo si el valor que tiene es
+// un estado fijo (no pisa un texto libre). null si no tiene el campo o ya estaba en ese estado.
+export function withUsState(text, state) {
+  for (const re of [US_BULLET_RE, US_INLINE_RE]) {
+    const m = re.exec(text ?? '')
+    if (!m) continue
+    if (!HARNESS_STATES.includes(m[2]) || m[2] === state) return null
+    return text.slice(0, m.index) + m[1] + state + text.slice(m.index + m[0].length)
+  }
+  return null
+}
+
+// INDEX.md con el estado de la fila del ticket cambiado (el primer estado fijo entre comillas invertidas de la fila).
+// null si no está la fila, no tiene estado o ya estaba en ese.
+export function withIndexState(text, key, state) {
+  const lines = String(text ?? '').split('\n')
+  const i = lines.findIndex((l) => l.startsWith(`| ${key} |`))
+  if (i < 0) return null
+  const m = [...lines[i].matchAll(/`([a-z-]+)`/g)].find((x) => HARNESS_STATES.includes(x[1]))
+  if (!m || m[1] === state) return null
+  lines[i] = lines[i].slice(0, m.index) + '`' + state + '`' + lines[i].slice(m.index + m[0].length)
+  return lines.join('\n')
 }
 
 const names = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()) : null)
@@ -371,7 +417,7 @@ export function trailLine(from, to, date = new Date()) {
 }
 
 // Agrega la línea al final del roadmap.md de la carpeta. Si no hay roadmap.md, no crea nada (devuelve false).
-// Toca solo ese archivo: el estado del harness (US.md, INDEX.md) no se cambia desde acá.
+// Toca solo ese archivo: el estado del harness (US.md, INDEX.md) lo cambia writeHarnessState en server.mjs.
 export function appendTrail(folder, line) {
   const file = join(folder, 'roadmap.md')
   let text

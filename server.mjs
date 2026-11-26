@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { activateWorktree, createWorkspaceChat, focusTerminal, launchChat, openSessions, openTerminal, worktrees as orcaWorktrees } from './orca-tab.mjs'
-import { appendTrail, applyTransition, BLOCKER_FILES, blockerIn, branchFor, defaultHidden, DONE_DAYS, DONE_MAX, doneStatuses, fetchMyIssues, fetchProjectStatuses, fetchTransitions, fillPrompt, hiddenFrom, jiraConfig, jiraRows, jiraSections, jiraTargets, pushedIn, rememberStart, sameName, sessionsOf, trailLine, TRANSITION_ID_RE, visibleRows } from './jira.mjs'
+import { appendTrail, applyTransition, harnessStateFor, HARNESS_STATES, withIndexState, withUsState, BLOCKER_FILES, blockerIn, branchFor, defaultHidden, DONE_DAYS, DONE_MAX, doneStatuses, fetchMyIssues, fetchProjectStatuses, fetchTransitions, fillPrompt, hiddenFrom, jiraConfig, jiraRows, jiraSections, jiraTargets, pushedIn, rememberStart, sameName, sessionsOf, trailLine, TRANSITION_ID_RE, visibleRows } from './jira.mjs'
 import { buildSnapshot, isTerminal } from './pitwall.mjs'
 import { cachePath } from './state.mjs'
 
@@ -50,7 +50,6 @@ const JIRA_STATUSES_MS = 60 * 60_000
 const CLI_REASON_MAX = 300
 const JIRA_KEY_RE = /^[A-Z][A-Z0-9_]+-\d+$/
 const DONE_CATEGORY = 'done'
-const HARNESS_STATES = ['nuevo', 'planificado', 'en-progreso', 'en-review', 'en-correccion', 'listo-para-probar', 'listo-para-deploy', 'desplegado', 'bloqueado', 'descartado']
 const INLINE_STATE_RE = /\*\*Estado:\*\*\s*`?([a-z][a-z-]*[a-z])/
 const DEPLOYED_RE = /^- \*\*Estado:\*\*\s*`?ejecutado/m
 // Solo pide confirmación: un falso positivo cuesta un clic, y un secreto subido no se puede deshacer.
@@ -124,7 +123,7 @@ function readLiveState(dir) {
   // Es la base viva de Orca: orca-data.json solo se exporta al abrir la app y deja afuera los cambios recientes.
   const db = new DatabaseSync(join(dir, 'profile-state.db'), { readOnly: true })
   try {
-    const rows = db.prepare("select domain, payload from profile_state_documents where domain in ('repos', 'projectGroups')").all()
+    const rows = db.prepare("select domain, payload from profile_state_documents where domain in ('repos', 'projectGroups', 'settings')").all()
     const docs = Object.fromEntries(rows.map((r) => [r.domain, JSON.parse(r.payload)]))
     return Array.isArray(docs.repos) ? docs : null
   } finally {
@@ -260,6 +259,55 @@ function listFrom(source) {
 
 const inScope = (entry, path) => !entry?.under || path === entry.under || path.startsWith(entry.under + sep)
 
+// La carpeta donde Orca crea sus workspaces (`settings.workspaceDir`). MRG_ORCA_WORKSPACES la fija (las pruebas).
+const ORCA_DIR_MS = 60_000
+let orcaDirCache = null
+function orcaWorkspaceDir() {
+  if (process.env.MRG_ORCA_WORKSPACES !== undefined) return process.env.MRG_ORCA_WORKSPACES || null
+  if (orcaDirCache && Date.now() - orcaDirCache.at < ORCA_DIR_MS) return orcaDirCache.dir
+  let dir = null
+  try {
+    const raw = orcaData().settings?.workspaceDir
+    dir = typeof raw === 'string' && raw ? resolve(expandHome(raw)).replace(/\/+$/, '') : null
+  } catch {
+    // Sin los datos de Orca no se reconoce por la carpeta; queda la lista viva de Orca al borrar.
+  }
+  orcaDirCache = { at: Date.now(), dir }
+  return dir
+}
+
+// Un worktree que es un workspace de Orca: está en su carpeta de workspaces o Orca lo lista (`live`: sus rutas).
+// Borrarlo por git hace que Orca saque el workspace y, con él, la conversación que vivía ahí.
+export function isOrcaWorkspace(path, dir, live = new Set()) {
+  const clean = String(path ?? '').replace(/\/+$/, '')
+  return live.has(clean) || (!!dir && clean.startsWith(dir + sep))
+}
+
+export const ORCA_WORKSPACE_REASON = 'Es un workspace de Orca: borrarlo por git se lleva también su conversación. Cerralo o archivalo desde Orca.'
+
+// Si el programa que corre un comando configurado existe en esta máquina. Un alias de git que llama a un script
+// (`!bash ~/.config/git/x.sh`) cuenta solo si el script está. Devuelve null si anda, o el porqué si no.
+const SHELLS = new Set(['bash', 'sh', 'zsh', 'env'])
+const onPath = (name) => (process.env.PATH ?? '').split(':').some((d) => d && existsSync(join(d, name)))
+function missingProgram(words) {
+  const rest = words.filter(Boolean)
+  while (rest.length > 1 && SHELLS.has(rest[0])) rest.shift()
+  const program = rest[0]
+  if (!program) return null
+  if (program.includes('/') || program.startsWith('~')) return existsSync(expandHome(program)) ? null : `falta ${program}`
+  return onPath(program) ? null : `no está ${program}`
+}
+export async function commandProblem(template, cwd) {
+  const words = String(template ?? '').trim().split(/\s+/)
+  if (words[0] !== 'git') return missingProgram(words)
+  if (!words[1] || words[1].startsWith('-')) return null
+  // Se lee cada vez (es un `git config`): si arreglás el alias o aparece el script, el botón vuelve solo.
+  const alias = (await run(['-C', cwd, 'config', '--get', `alias.${words[1]}`])).stdout.trim()
+  if (!alias.startsWith('!')) return null // un subcomando de git, o un alias a otro subcomando
+  const why = missingProgram(alias.slice(1).trim().split(/\s+/))
+  return why ? `git ${words[1]}: ${why}` : null
+}
+
 export const shellQuote = (text) => `'${String(text).replaceAll("'", `'\\''`)}'`
 
 export function fillCommand(template, values) {
@@ -346,6 +394,27 @@ function writeTrail(dir, key, from, to) {
   }
 }
 
+// El estado del harness que toma el ticket al moverlo en Jira desde el panel (jira.harnessStates): en US.md, si tiene el
+// campo, y en su fila de INDEX.md, que tienen que coincidir siempre. Solo los abiertos (no _archivo).
+// 'ok' si cambió algo, 'none' si no hay mapeo, carpeta o campo (o ya estaba), 'error' si falló al escribir.
+function writeHarnessState(dir, key, to, map) {
+  const state = harnessStateFor(map, to)
+  const folder = state && dir ? ticketFolder(dir, key) : null
+  if (!folder || basename(dirname(folder)) === '_archivo') return { stateWrite: 'none' }
+  try {
+    let changed = false
+    for (const [file, next] of [[join(folder, 'US.md'), (t) => withUsState(t, state)], [join(dir, 'INDEX.md'), (t) => withIndexState(t, key, state)]]) {
+      const text = readText(file)
+      const updated = text == null ? null : next(text)
+      if (updated != null) { writeFileSync(file, updated); changed = true }
+    }
+    return changed ? { stateWrite: 'ok', harnessState: state } : { stateWrite: 'none' }
+  } catch (e) {
+    console.error(`no pude cambiar el estado de ${key} en el harness: ${e.message}`)
+    return { stateWrite: 'error', stateError: e.code ?? 'error de escritura' }
+  }
+}
+
 // Lo que el harness asienta de un ticket de Jira: su estado (US.md), si el deploy se ejecutó y la traba de negocio
 // abierta, si tiene. Los archivados no traban.
 function harnessOf(dir, key) {
@@ -401,14 +470,19 @@ async function scanPush(root, path, range) {
   }
 }
 
-function commandsFor(root, { isMerging, base, isProtected, isStanding = false }) {
+function commandsFor(root, { isMerging, base, isProtected, isStanding = false, worktreeProblems = {} }) {
   const { commands, worktrees } = readPolicy()
   const applies = (c) => inScope(c, root) && (c.when !== 'merging' || isMerging) && (c.when !== 'feature' || (!isProtected && !isStanding))
   const list = commands.flatMap((c, id) =>
     applies(c) ? [{ id, label: c.label.replaceAll('{base}', base), hint: c.hint ?? c.run, run: c.run, warn: !!c.warn, urgent: c.when === 'merging' }] : []
   )
   const wt = worktrees && inScope(worktrees, root) ? worktrees : null
-  return { commands: list, canCreateWorktree: !!wt?.create, canRemoveWorktree: !!wt?.remove }
+  return {
+    commands: list,
+    canCreateWorktree: !!wt?.create && !worktreeProblems.create,
+    canRemoveWorktree: !!wt?.remove && !worktreeProblems.remove,
+    worktreeProblem: wt ? worktreeProblems.remove ?? worktreeProblems.create ?? null : null
+  }
 }
 
 const remoteHeads = new Map()
@@ -522,6 +596,18 @@ async function mergedInto(path, branch, base) {
   return null
 }
 
+// Qué comandos de worktree configurados no andan en esta máquina: { create?: porqué, remove?: porqué }.
+async function worktreeProblems(root) {
+  const { worktrees } = readPolicy()
+  if (!worktrees || !inScope(worktrees, root)) return {}
+  const out = {}
+  for (const kind of ['create', 'remove']) {
+    const problem = worktrees[kind] ? await commandProblem(worktrees[kind], root) : null
+    if (problem) out[kind] = problem
+  }
+  return out
+}
+
 async function summary(item) {
   const { head, staged, changes } = await status(item.path)
   const root = item.root ?? item.path
@@ -534,8 +620,9 @@ async function summary(item) {
   const isStanding = readPolicy().standing.includes(branch)
   const isFeature = !detached && branch !== base && !blocked.has(branch) && !isStanding
   return {
+    orcaWorkspace: !!item.worktreeOf && isOrcaWorkspace(item.path, orcaWorkspaceDir()),
     key: item.key, name: item.name, group: item.group, color: item.color, branch, base, deploys,
-    worktreeOf: item.worktreeOf ?? null, ...commandsFor(root, { isMerging: stopped(item.path), base, isProtected: blocked.has(branch), isStanding }),
+    worktreeOf: item.worktreeOf ?? null, ...commandsFor(root, { isMerging: stopped(item.path), base, isProtected: blocked.has(branch), isStanding, worktreeProblems: await worktreeProblems(root) }),
     detached, upstream, crossedUpstream: upstream && upstream !== `origin/${branch}` ? upstream : null,
     ticket: detached ? null : ticketOf(root, branch),
     pr: offersPr ? prUrl(await remoteUrl(item.path), branch, base) : null,
@@ -634,11 +721,17 @@ async function terminalCommand(item, body) {
       const branch = String(body.branch ?? '').trim()
       const valid = await run(['check-ref-format', '--branch', branch])
       if (valid.code !== 0 || branch.startsWith('-')) throw new ActionError('Nombre de rama inválido.')
+      const problem = await commandProblem(worktrees.create, root)
+      if (problem) throw new ActionError(`El comando de worktrees no anda en esta máquina (${problem}).`)
       return { title: `worktree ${branch}`, command: fillCommand(worktrees.create, { ...values, branch }) }
     }
     if (!item.worktreeOf) throw new ActionError('Esto no es un worktree.')
     const branch = (await git(item.path, 'symbolic-ref', '--short', '-q', 'HEAD')).trim()
-    if (branch) return { title: `borrar ${branch}`, command: fillCommand(worktrees.remove, { ...values, branch }) }
+    if (branch) {
+      const problem = await commandProblem(worktrees.remove, root)
+      if (problem) throw new ActionError(`El comando para borrar worktrees no anda en esta máquina (${problem}).`)
+      return { title: `borrar ${branch}`, command: fillCommand(worktrees.remove, { ...values, branch }) }
+    }
     // Detached (un worktree abierto en un commit suelto): el comando configurado borra por rama y acá no hay
     // ninguna, así que va por la ruta. Con cambios, git lo frena salvo que el usuario haya confirmado perderlos.
     const force = body.force === true ? ' --force' : ''
@@ -923,7 +1016,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
       const target = jiraCaches[move.category === DONE_CATEGORY ? 'done' : 'open'].state
       if (target) target.issues.unshift(issue)
       // Jira ya cambió: si el rastro no se pudo escribir, se avisa, pero la transición cuenta como hecha.
-      return { key, from, status: move.to, ...writeTrail(cfg.tickets, key, from, move.to) }
+      return { key, from, status: move.to, ...writeTrail(cfg.tickets, key, from, move.to), ...writeHarnessState(cfg.tickets, key, move.to, cfg.harnessStates) }
     } catch (e) {
       throw e instanceof ActionError ? e : new ActionError(e.message)
     }
@@ -1016,6 +1109,18 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
       }
     }
     await orca.activate(known.worktreeId)
+  }
+
+  // Un workspace de Orca no se borra por git: Orca sacaría el workspace y con él la conversación. Se mira la carpeta de
+  // workspaces y, además, la lista viva de Orca (un workspace puede estar en otro lado).
+  async function refuseOrcaWorkspace(item) {
+    let live = new Set()
+    try {
+      live = new Set((await orca.worktrees()).map((w) => String(w.path ?? '').replace(/\/+$/, '')))
+    } catch {
+      // Orca no respondió: queda la carpeta de workspaces.
+    }
+    if (isOrcaWorkspace(item.path, orcaWorkspaceDir(), live)) throw new ActionError(ORCA_WORKSPACE_REASON)
   }
 
   // Vence la consulta pero conserva changedAt: si no, todos los repos pasarían a contar como activos.
@@ -1137,6 +1242,7 @@ export function startServer({ port = 0, idleMs = 0, onIdle, terminal = openTermi
     if (url.pathname === '/api/jira-transition') return reply(res, 200, await jiraTransition(body))
     const item = repoOf(body.repo)
     if (url.pathname === '/api/run') {
+      if (body.command === 'wt-remove') await refuseOrcaWorkspace(item)
       const { title, command } = await terminalCommand(item, body)
       try {
         await terminal({ title, command, floating: readPolicy().floating })
