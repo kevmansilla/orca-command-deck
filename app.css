@@ -297,3 +297,27 @@ button.label-h.fold.sub { margin:10px 0 6px; letter-spacing:.06em; text-transfor
 .jfilter-l { font:600 9.5px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--muted); }
 .pchip.jstatus.off { color:var(--muted); border-style:dashed; border-color:var(--line); text-decoration:line-through; }
 .jnote { font-size:10.5px; color:var(--muted); margin-top:4px; }
+
+/* Arrancar un ticket: el selector de workspace (startPicker). Todo bajo #box.sp para no tocar los otros diálogos. */
+#box.sp { width:520px; max-height:70vh; }
+#box.sp .sp-head { padding:12px 12px 10px; border-bottom:1px solid var(--line); display:flex; flex-direction:column; gap:10px; }
+#box.sp .sp-title { display:flex; align-items:baseline; gap:8px; min-width:0; }
+#box.sp .sp-key { font:600 12px var(--mono); color:var(--primary); flex:none; }
+#box.sp .sp-sum { font-size:13px; font-weight:600; color:var(--fg); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#box.sp input { height:32px; padding:0 10px; border:1px solid var(--line); border-radius:var(--radius); background:var(--bg); }
+#box.sp input:focus { outline:none; border-color:var(--ring); box-shadow:0 0 0 2px color-mix(in srgb, var(--ring) 25%, transparent); }
+#box.sp .list { padding:4px 6px 8px; }
+#box.sp .opt-h { position:sticky; top:-4px; z-index:1; padding:10px 6px 4px; background:var(--orca-popover, var(--card)); }
+#box.sp .sp-proj { display:flex; align-items:center; gap:8px; padding:6px 6px 2px; }
+#box.sp .sp-pname { flex:1; min-width:0; font-size:12px; font-weight:600; color:var(--soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#box.sp .sp-new { flex:none; height:22px; padding:0 8px; border:1px dashed color-mix(in srgb, var(--primary) 55%, transparent); border-radius:999px; background:none; color:var(--primary); font-size:11px; cursor:pointer; opacity:.75; }
+#box.sp .sp-new:hover, #box.sp .sp-new.on { opacity:1; background:color-mix(in srgb, var(--primary) 12%, transparent); border-style:solid; }
+#box.sp .sp-ws { margin-left:10px; padding:4px 8px 4px 10px; min-height:28px; gap:8px; border-left:1px solid var(--line); border-radius:0 5px 5px 0; }
+#box.sp .sp-ws.on { background:var(--hover); border-left-color:var(--primary); }
+#box.sp .sp-ws:hover { background:var(--hover); }
+#box.sp .sp-name { flex:1; min-width:0; color:var(--fg); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#box.sp .sp-branch { flex:none; max-width:45%; font:10px var(--mono); color:var(--faint); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#box.sp .sp-agents { flex:none; display:inline-flex; align-items:center; gap:5px; padding:1px 7px; border-radius:999px; font:10px var(--mono); color:var(--c-working); background:color-mix(in srgb, var(--c-working) 12%, transparent); }
+#box.sp .sp-agents::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
+#box.sp .sp-empty { padding:24px 12px; text-align:center; color:var(--muted); font-size:12px; }
+#box.sp .sp-foot { padding:6px 12px; border-top:1px solid var(--line); font:10px var(--mono); color:var(--faint); }

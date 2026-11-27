@@ -380,7 +380,10 @@ function historyView(r, wrap) {
     wrap.appendChild(item)
   })
 }
-function closeModal() { document.getElementById('modal').style.display = 'none' }
+function closeModal() {
+  document.getElementById('modal').style.display = 'none'
+  document.getElementById('box').className = ''  // la clase de un diálogo (el selector de Arrancar) no pasa al siguiente
+}
 document.getElementById('modal').onclick = function (e) { if (e.target === this) closeModal() }
 // Esc cierra primero el diálogo y, si no hay ninguno, el diff.
 document.addEventListener('keydown', function (e) {
@@ -1156,11 +1159,16 @@ function openStatusMenu(key) {
 function placeStatusMenu(menu) {
   var anchor = boardInner.querySelector('[data-tstatus="' + menu.dataset.key + '"]')
   if (!anchor) return closeStatusMenu()
+  // Con el zoom propio (zoom en <html>), getBoundingClientRect y el viewport vienen en px de pantalla, pero
+  // left/top y offsetWidth/Height van en px sin zoom: se pasa todo a px sin zoom, o el menú se corre con el zoom.
+  var z = zoom || 1
   var r = anchor.getBoundingClientRect()
+  var left = r.left / z, top = r.top / z, bottom = r.bottom / z
+  var vw = window.innerWidth / z, vh = window.innerHeight / z
   var w = menu.offsetWidth
   var h = menu.offsetHeight
-  menu.style.left = Math.max(4, Math.min(r.left, window.innerWidth - w - 4)) + 'px'
-  menu.style.top = (r.bottom + 4 + h > window.innerHeight && r.top - 4 - h > 0 ? r.top - 4 - h : r.bottom + 4) + 'px'
+  menu.style.left = Math.max(4, Math.min(left, vw - w - 4)) + 'px'
+  menu.style.top = (bottom + 4 + h > vh && top - 4 - h > 0 ? top - 4 - h : bottom + 4) + 'px'
 }
 function applyStatus(t, tr) {
   jiraMoves[t.key] = { busy: true }
@@ -1301,44 +1309,78 @@ function loadJira() {
   }).catch(function (e) { console.error('[command-deck] no pude leer Jira', e) }).then(renderBoard)
 }
 // Arrancar: elegís un workspace abierto (agrupados como en la barra lateral de Orca) y se abre ahí un chat nativo con
-// el primer mensaje, sin tocar git; o, al final de cada proyecto, un workspace nuevo con la rama del ticket.
+// el primer mensaje, sin tocar git; o, desde el encabezado de cada proyecto, un workspace nuevo con la rama del ticket.
+// Con el teclado: flechas para moverse, Enter para elegir (lo primero que coincide queda marcado).
 function startPicker(key) {
   var t = ticketOf(key)
   if (!t) return
   api('/api/jira-targets').then(function (j) {
     var box = document.getElementById('box')
     box.textContent = ''
+    box.className = 'sp'
+    var head = el('div', 'sp-head')
+    var title = el('div', 'sp-title')
+    title.appendChild(el('span', 'sp-key', key))
+    title.appendChild(el('span', 'sp-sum', t.title && t.title !== key ? t.title : 'Elegí dónde arrancar'))
+    head.appendChild(title)
     var input = el('input')
-    input.placeholder = 'Workspace donde arrancar ' + key
-    box.appendChild(input)
+    input.placeholder = 'Buscar proyecto, workspace o rama'
+    head.appendChild(input)
+    box.appendChild(head)
     var options = el('div', 'list')
     box.appendChild(options)
-    function option(text, meta, cls, fn) {
-      var o = el('div', 'opt' + (cls ? ' ' + cls : ''))
-      o.appendChild(el('span', '', text))
-      o.appendChild(el('span', 'meta', meta))
-      o.onclick = function () { closeModal(); fn() }
-      options.appendChild(o)
+    box.appendChild(el('div', 'sp-foot', '↑↓ moverse · Enter elegir · Esc cerrar'))
+    var items = [], active = 0
+    function item(node, fn) {
+      node.classList.add('sp-item')
+      node.onclick = function (e) { e.stopPropagation(); closeModal(); fn() }
+      node.onmouseenter = function () { mark(items.indexOf(node)) }
+      items.push(node)
+      return node
+    }
+    function mark(n) {
+      if (!items.length) return
+      active = (n + items.length) % items.length
+      items.forEach(function (x, k) { x.classList.toggle('on', k === active) })
+      items[active].scrollIntoView({ block: 'nearest' })
     }
     function paint() {
       var term = input.value.trim().toLowerCase()
       options.textContent = ''
+      items = []
       var lastGroup = null
       j.projects.forEach(function (p) {
         var hit = !term || (p.project + ' ' + p.group).toLowerCase().indexOf(term) >= 0
         var spaces = p.workspaces.filter(function (w) { return hit || (w.name + ' ' + (w.branch || '')).toLowerCase().indexOf(term) >= 0 })
         if (!hit && !spaces.length) return
         if (p.group !== lastGroup) { options.appendChild(el('div', 'opt-h', p.group || 'Sin grupo')); lastGroup = p.group }
-        options.appendChild(el('div', 'opt-p', p.project))
+        var proj = el('div', 'sp-proj')
+        proj.appendChild(el('span', 'sp-pname', p.project))
+        var nuevo = el('button', 'sp-new', '＋ nuevo')
+        nuevo.type = 'button'
+        nuevo.title = 'Workspace nuevo con la rama ' + t.key + '-…, desde la base del repo'
+        proj.appendChild(item(nuevo, function () { confirmNewWorkspace(t, p.repo) }))
+        options.appendChild(proj)
         spaces.forEach(function (w) {
-          var meta = [w.branch && w.branch !== w.name ? w.branch : '', w.agents ? plural(w.agents, 'agente', 'agentes') : ''].filter(Boolean).join(' · ')
-          option(w.name, meta, w.agents ? 'busy' : '', function () { startChat(t, w) })
+          var o = el('div', 'opt sp-ws' + (w.agents ? ' busy' : ''))
+          o.appendChild(el('span', 'sp-name', w.name))
+          if (w.branch && w.branch !== w.name) o.appendChild(el('span', 'sp-branch', w.branch))
+          if (w.agents) o.appendChild(el('span', 'sp-agents', plural(w.agents, 'agente', 'agentes')))
+          options.appendChild(item(o, function () { startChat(t, w) }))
         })
-        option('＋ workspace nuevo ' + t.key + '-…', 'rama desde la base', 'new', function () { confirmNewWorkspace(t, p.repo) })
       })
-      if (!options.childNodes.length) options.appendChild(el('div', 'opt-h', 'Ningún workspace coincide.'))
+      if (!options.childNodes.length) options.appendChild(el('div', 'sp-empty', 'Ningún workspace coincide con «' + input.value.trim() + '».'))
+      // Con algo escrito, arranca marcado el primer workspace (no el «＋ nuevo»); sin nada, nada marcado.
+      var first = items.findIndex(function (x) { return x.classList.contains('sp-ws') })
+      if (term && first >= 0) mark(first)
+      else active = -1
     }
     input.oninput = paint
+    input.onkeydown = function (e) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); mark(active < 0 ? 0 : active + 1) }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); mark(active < 0 ? items.length - 1 : active - 1) }
+      else if (e.key === 'Enter' && active >= 0 && items[active]) { e.preventDefault(); items[active].click() }
+    }
     paint()
     document.getElementById('modal').style.display = 'flex'
     input.focus()
